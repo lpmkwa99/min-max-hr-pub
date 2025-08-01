@@ -362,6 +362,40 @@ def init_db() -> None:
     conn.commit()
     conn.close()
 
+    # Gamification tables
+    # Achievements definitions table holds the set of all possible achievements
+    # along with their XP rewards. The user_achievements table links users
+    # to achievements they have earned and records the timestamp. Storing
+    # achievements separately allows us to add new achievements without
+    # modifying existing user records and to award XP automatically when
+    # achievements are earned【644198553755745†L524-L603】.
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS achievements_def (
+            key TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT,
+            xp_reward INTEGER NOT NULL
+        );
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_achievements (
+            user_id INTEGER NOT NULL,
+            achievement_key TEXT NOT NULL,
+            achieved_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, achievement_key),
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (achievement_key) REFERENCES achievements_def(key)
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
 
 def get_db_connection() -> sqlite3.Connection:
     """Return a new SQLite connection with row factory set to dict-like."""
@@ -641,6 +675,140 @@ def get_calibration_params(org_id: int) -> Dict[str, float]:
     return params
 
 
+################################################################################
+# Gamification Helpers
+################################################################################
+
+def init_gamification() -> None:
+    """Populate the achievements definition table with default entries.
+
+    This function seeds the database with a set of core achievements if
+    none exist. Achievements are defined by a unique key, a user‑friendly
+    name, a description, and the amount of XP awarded upon earning them.
+    The initial set covers the primary user actions described in the
+    implementation plan: creating a scenario, running a simulation,
+    uploading calibration data, requesting recommendations, and performing
+    a hot swap analysis【644198553755745†L524-L603】. Calling this function
+    repeatedly is safe; it inserts definitions only if the table is empty.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) AS count FROM achievements_def")
+    row = cur.fetchone()
+    if row and row["count"] > 0:
+        conn.close()
+        return
+    achievements = [
+        ("scenario_first", "First Scenario", "Create your first scenario", 50),
+        ("simulate_first", "First Simulation", "Run your first simulation", 20),
+        ("calibration_first", "First Calibration", "Upload your first calibration dataset", 20),
+        ("recommendations_first", "First Recommendations", "Request recommendations for the first time", 20),
+        ("hot_swap_first", "First Hot Swap", "Perform your first hot swap analysis", 30),
+    ]
+    for key, name, description, xp_reward in achievements:
+        cur.execute(
+            "INSERT INTO achievements_def (key, name, description, xp_reward) VALUES (?, ?, ?, ?)",
+            (key, name, description, xp_reward),
+        )
+    conn.commit()
+    conn.close()
+
+
+def award_xp(user_id: int, org_id: int, xp_amount: int) -> None:
+    """Grant XP to a user and update their level accordingly.
+
+    XP is accumulated on the users table. Levels are computed as
+    ``1 + xp // 100``, meaning each 100 XP yields a new level. When
+    awarding XP, an audit entry is recorded for traceability. Negative
+    or zero amounts are ignored.
+    """
+    if xp_amount <= 0:
+        return
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT xp, level FROM users WHERE id = ?", (user_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return
+    current_xp = row["xp"] or 0
+    current_level = row["level"] or 1
+    new_xp = current_xp + xp_amount
+    new_level = 1 + new_xp // 100
+    cur.execute("UPDATE users SET xp = ?, level = ? WHERE id = ?", (new_xp, new_level, user_id))
+    conn.commit()
+    conn.close()
+    # Audit event for XP award
+    log_audit_event(user_id, org_id, "xp_award", details=f"Awarded {xp_amount} XP; new level {new_level}")
+
+
+def award_achievement(user_id: int, org_id: int, key: str) -> None:
+    """Mark an achievement as earned for a user and award its XP.
+
+    The function checks whether the user already has the specified
+    achievement. If not, it inserts a record into ``user_achievements``,
+    retrieves the XP reward from ``achievements_def``, and then calls
+    ``award_xp`` to grant the XP. An audit entry is created for the
+    achievement award. Unknown achievement keys are silently ignored.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Check if user already has achievement
+    cur.execute(
+        "SELECT 1 FROM user_achievements WHERE user_id = ? AND achievement_key = ?",
+        (user_id, key),
+    )
+    if cur.fetchone():
+        conn.close()
+        return
+    # Retrieve definition
+    cur.execute("SELECT xp_reward FROM achievements_def WHERE key = ?", (key,))
+    def_row = cur.fetchone()
+    if not def_row:
+        conn.close()
+        return
+    xp_reward = def_row["xp_reward"]
+    # Insert user achievement
+    now = _dt.datetime.utcnow().isoformat()
+    cur.execute(
+        "INSERT INTO user_achievements (user_id, achievement_key, achieved_at) VALUES (?, ?, ?)",
+        (user_id, key, now),
+    )
+    conn.commit()
+    conn.close()
+    # Award XP for the achievement
+    award_xp(user_id, org_id, xp_reward)
+    # Log achievement award
+    log_audit_event(user_id, org_id, "achievement_award", details=f"Achievement {key} awarded")
+
+
+def process_gamification_event(user_id: int, org_id: int, event: str) -> None:
+    """Handle a gamification event by awarding XP and achievements.
+
+    Events correspond to user actions. The mapping of events to XP
+    amounts and achievements is defined inline. If an event is not
+    recognized, no action is taken. Achievements are only awarded
+    once per user; subsequent occurrences grant XP but skip the
+    achievement record if already earned.
+    """
+    rules = {
+        "scenario_create": {"xp": 50, "achievement": "scenario_first"},
+        "simulate": {"xp": 10, "achievement": "simulate_first"},
+        "calibration_upload": {"xp": 20, "achievement": "calibration_first"},
+        "recommendations": {"xp": 20, "achievement": "recommendations_first"},
+        "hot_swap": {"xp": 30, "achievement": "hot_swap_first"},
+    }
+    rule = rules.get(event)
+    if not rule:
+        return
+    xp_amount = rule.get("xp", 0)
+    achievement_key = rule.get("achievement")
+    if xp_amount:
+        award_xp(user_id, org_id, xp_amount)
+    if achievement_key:
+        award_achievement(user_id, org_id, achievement_key)
+
+
 # Ensure the database schema is created on module import. This call
 # executes the CREATE TABLE statements in init_db() so that all
 # subsequent operations against the database can succeed. It is safe
@@ -653,6 +821,14 @@ init_db()
 # Index. It is safe to call multiple times because it checks whether
 # the table already contains entries before inserting new ones.
 init_vendor_data()
+
+# Populate the achievements definitions table. Like vendor data, this
+# initialization inserts default achievements only if none exist. It
+# must be called after ``init_db`` so that the tables are present and
+# after ``init_vendor_data`` to ensure the database connection has been
+# established. Achievements enable the gamification engine to award
+# XP and badges for user actions.
+init_gamification()
 
 
 
@@ -878,6 +1054,8 @@ def create_scenario(
     conn.close()
     # Audit log
     log_audit_event(current_user["id"], current_user["org_id"], "scenario_create", details=f"Created scenario {name} (ID {scenario_id})")
+    # Gamification: award XP and check achievements
+    process_gamification_event(current_user["id"], current_user["org_id"], "scenario_create")
     return {
         "id": scenario_id,
         "tenant_id": current_user["org_id"],
@@ -1162,6 +1340,8 @@ def run_simulation(
     # Audit log – include scenario_name if provided
     scenario_name = payload.scenario_name or "ad‑hoc"
     log_audit_event(current_user["id"], current_user["org_id"], "simulate", details=f"Ran simulation ({scenario_name})")
+    # Gamification: award XP and achievements for simulation
+    process_gamification_event(current_user["id"], current_user["org_id"], "simulate")
     return SimulationResult(metrics=metrics, messages=messages)
 
 
@@ -1360,6 +1540,8 @@ def upload_calibration(
         "calibration_update",
         details=f"Updated calibration parameters: {', '.join(params.keys())}",
     )
+    # Gamification: award XP and achievements for calibration upload
+    process_gamification_event(current_user["id"], current_user["org_id"], "calibration_upload")
     return {
         "organization_id": current_user["org_id"],
         "updated_parameters": params,
@@ -2066,6 +2248,8 @@ def recommend_vendors(
         "recommendations",
         details=f"Generated {len(recommended_names)} recommendations within budget {payload.budget}",
     )
+    # Gamification: award XP and achievements for requesting recommendations
+    process_gamification_event(current_user["id"], current_user["org_id"], "recommendations")
     return RecommendationResult(recommendations=recommended_names, rationale=rationale)
 
 
@@ -2192,6 +2376,8 @@ def perform_hot_swap(
         "hot_swap",
         details=f"Performed hot swap analysis on stack of {len(payload.current_stack)} vendors",
     )
+    # Gamification: award XP and achievements for hot swap
+    process_gamification_event(current_user["id"], current_user["org_id"], "hot_swap")
     return HotSwapResult(
         missing_capabilities=missing_categories,
         performance_gaps=gaps,
@@ -2199,6 +2385,127 @@ def perform_hot_swap(
         budget_misalignment=budget_misalignment,
         suggestions=suggestions,
     )
+
+
+################################################################################
+# Gamification Endpoints
+################################################################################
+
+@app.get("/xp")
+def get_user_xp(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """Return the current user's XP and level.
+
+    XP and level are stored on the users table. This endpoint allows
+    users to see their progress in the gamification system. An audit
+    entry is recorded when viewed.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT xp, level FROM users WHERE id = ?", (current_user["id"],))
+    row = cur.fetchone()
+    conn.close()
+    xp = row["xp"] if row else 0
+    level = row["level"] if row else 1
+    # Audit log for viewing XP
+    log_audit_event(
+        current_user["id"],
+        current_user["org_id"],
+        "xp_view",
+        details="Viewed XP and level",
+    )
+    return {"xp": xp, "level": level}
+
+
+@app.get("/achievements")
+def list_achievements(current_user: Dict[str, Any] = Depends(get_current_user)) -> List[Dict[str, Any]]:
+    """List all achievements definitions and indicate which ones the user has earned.
+
+    Returns a list of achievement objects with keys ``key``, ``name``,
+    ``description``, ``xp_reward``, ``earned`` (boolean), and
+    ``achieved_at`` (ISO timestamp or None). An audit entry is logged.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Fetch definitions
+    cur.execute("SELECT key, name, description, xp_reward FROM achievements_def ORDER BY name ASC")
+    defs = cur.fetchall()
+    # Fetch user's earned achievements
+    cur.execute("SELECT achievement_key, achieved_at FROM user_achievements WHERE user_id = ?", (current_user["id"],))
+    earned = {row["achievement_key"]: row["achieved_at"] for row in cur.fetchall()}
+    conn.close()
+    achievements_list: List[Dict[str, Any]] = []
+    for row in defs:
+        key = row["key"]
+        achievements_list.append(
+            {
+                "key": key,
+                "name": row["name"],
+                "description": row["description"],
+                "xp_reward": row["xp_reward"],
+                "earned": key in earned,
+                "achieved_at": earned.get(key),
+            }
+        )
+    # Audit
+    log_audit_event(
+        current_user["id"],
+        current_user["org_id"],
+        "achievements_view",
+        details="Viewed achievements",
+    )
+    return achievements_list
+
+
+@app.get("/leaderboard")
+def get_leaderboard(
+    scope: str = "org",
+    size: int = 10,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> List[Dict[str, Any]]:
+    """Return a leaderboard of users ranked by XP.
+
+    ``scope`` may be ``org`` to limit the leaderboard to the current
+    organization or ``global`` to include all users. ``size`` controls
+    the maximum number of users returned (1–100). Results include
+    rank, username, XP, and level. An audit entry is recorded when
+    viewed.
+    """
+    # Sanitize size
+    size = max(1, min(size, 100))
+    conn = get_db_connection()
+    cur = conn.cursor()
+    if scope == "global":
+        cur.execute(
+            "SELECT username, xp, level FROM users ORDER BY xp DESC, username ASC LIMIT ?",
+            (size,),
+        )
+    else:
+        cur.execute(
+            "SELECT username, xp, level FROM users WHERE org_id = ? ORDER BY xp DESC, username ASC LIMIT ?",
+            (current_user["org_id"], size),
+        )
+    rows = cur.fetchall()
+    conn.close()
+    leaderboard: List[Dict[str, Any]] = []
+    rank = 1
+    for row in rows:
+        leaderboard.append(
+            {
+                "rank": rank,
+                "username": row["username"],
+                "xp": row["xp"],
+                "level": row["level"],
+            }
+        )
+        rank += 1
+    # Audit
+    log_audit_event(
+        current_user["id"],
+        current_user["org_id"],
+        "leaderboard_view",
+        details=f"Viewed leaderboard (scope={scope})",
+    )
+    return leaderboard
 
 
 ################################################################################
