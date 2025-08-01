@@ -174,21 +174,25 @@ MODULE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "description": "Investments that reduce regulatory risk and compliance issues.",
         "sliders": ["compliance_investment", "policy_automation", "audit_training"],
     },
+    # Customer Support & CX module: simplified to two high‑level sliders per spec
     "Customer Support & CX": {
-        "description": "Investments that increase customer satisfaction and retention.",
-        "sliders": ["support_staffing", "self_service_tools", "personalization"],
+        "description": "Investments that increase customer satisfaction, reduce churn, and improve onboarding.",
+        "sliders": ["support_investment", "onboarding_quality"],
     },
+    # Finance & Accounting module: simplified to two sliders representing automation and cost optimization
     "Finance & Accounting": {
-        "description": "Investments in financial efficiency and reporting accuracy.",
-        "sliders": ["automation_tools", "accounts_payable", "strategic_planning"],
+        "description": "Investments in financial process automation and cost optimization initiatives.",
+        "sliders": ["financial_process_automation", "cost_optimization"],
     },
+    # IT Infrastructure & Security module: two sliders for modernization and cybersecurity spend
     "IT Infrastructure & Security": {
-        "description": "Investments in modernization and cybersecurity.",
-        "sliders": ["it_modernization", "cybersecurity", "infrastructure_redundancy"],
+        "description": "Investments in IT modernization and cybersecurity to improve uptime and reduce incidents.",
+        "sliders": ["it_modernization_budget", "cybersecurity_spend"],
     },
+    # Procurement & Supply Chain module: two sliders for inventory and supplier management
     "Procurement & Supply Chain": {
-        "description": "Investments to optimize inventory and supplier relationships.",
-        "sliders": ["inventory_optimization", "supplier_management", "logistics"],
+        "description": "Investments to optimize inventory turnover and supplier relationships.",
+        "sliders": ["inventory_optimization", "supplier_management"],
     },
 }
 
@@ -344,59 +348,166 @@ def run_simulation(
     simulation engine calibrated with organizational data.
     """
     sliders = payload.sliders
-    # Basic metrics initialization
-    metrics = {
+    # Import math for diminishing return calculations
+    import math
+
+    # Initialize metrics with sensible baseline values. Some metrics are on
+    # 0–100 scales (e.g. satisfaction, ROI), while others use domain‑specific
+    # units (e.g. hours or days) and are later converted to a normalized score.
+    base_values = {
+        "employee_satisfaction": 50.0,
+        "customer_satisfaction": 50.0,
+        "nps": -10.0,
+        "churn_rate": 15.0,  # percentage of customers leaving per period
+        "first_response_time": 24.0,  # hours to first response
+        "net_profit_margin": 10.0,  # percentage
+        "cogs_reduction": 0.0,  # percentage reduction in COGS
+        "budget_variance": 20.0,  # percentage variance (lower is better)
+        "system_uptime": 95.0,  # uptime percentage
+        "security_incidents": 5.0,  # incidents per period
+        "productivity_boost": 0.0,  # percentage increase
+        "inventory_turnover_ratio": 5.0,  # times per year
+        "procurement_cost_reduction": 0.0,  # percentage reduction
+        "lead_time": 10.0,  # days
         "roi": 0.0,
-        "employee_satisfaction": 0.0,
-        "customer_satisfaction": 0.0,
-        "net_profit_margin": 0.0,
-        "system_uptime": 0.0,
-        "inventory_turnover": 0.0,
     }
-    # Apply effects from People module sliders
-    people_training = sliders.get("training_budget", 0) / 100.0
-    benefits = sliders.get("benefits_budget", 0) / 100.0
-    wellness = sliders.get("wellness_programs", 0) / 100.0
-    metrics["employee_satisfaction"] += 40 * people_training + 30 * benefits + 20 * wellness
-    metrics["roi"] += 5 * (people_training + benefits + wellness)
-    # Marketing module
-    lead_gen = sliders.get("lead_generation", 0) / 100.0
-    social_media = sliders.get("social_media", 0) / 100.0
-    events = sliders.get("events", 0) / 100.0
-    metrics["roi"] += 60 * lead_gen + 30 * social_media + 10 * events
-    # Diminishing returns (quadratic penalty)
-    metrics["roi"] -= 10 * ((people_training + benefits + wellness) ** 2 + (lead_gen + social_media + events) ** 2)
-    # Customer Support & CX
-    support_staffing = sliders.get("support_staffing", 0) / 100.0
-    self_service = sliders.get("self_service_tools", 0) / 100.0
-    personalization = sliders.get("personalization", 0) / 100.0
-    metrics["customer_satisfaction"] += 50 * support_staffing + 30 * self_service + 20 * personalization
-    metrics["roi"] += 2 * (support_staffing + self_service + personalization)
-    # Finance & Accounting
-    automation = sliders.get("automation_tools", 0) / 100.0
-    accounts_payable = sliders.get("accounts_payable", 0) / 100.0
-    strategic_planning = sliders.get("strategic_planning", 0) / 100.0
-    metrics["net_profit_margin"] += 20 * automation + 10 * accounts_payable + 15 * strategic_planning
-    metrics["roi"] += 3 * (automation + accounts_payable + strategic_planning)
-    # IT Infrastructure & Security
-    it_modern = sliders.get("it_modernization", 0) / 100.0
-    cybersecurity = sliders.get("cybersecurity", 0) / 100.0
-    redundancy = sliders.get("infrastructure_redundancy", 0) / 100.0
-    metrics["system_uptime"] += 80 * it_modern + 50 * redundancy - 40 * cybersecurity  # note: cybersecurity lowers incidents but might reduce uptime if overloaded
-    metrics["roi"] += 1 * (it_modern + redundancy)  # small ROI improvements
-    # Procurement & Supply Chain
-    inventory_opt = sliders.get("inventory_optimization", 0) / 100.0
-    supplier_mgmt = sliders.get("supplier_management", 0) / 100.0
-    logistics = sliders.get("logistics", 0) / 100.0
-    metrics["inventory_turnover"] += 50 * inventory_opt + 30 * supplier_mgmt + 20 * logistics
-    metrics["net_profit_margin"] += 2 * (inventory_opt + supplier_mgmt + logistics)
-    # Normalize and bound metrics between 0 and 100
-    for k, v in metrics.items():
-        if k == "net_profit_margin":
-            # Net profit margin is allowed negative (loss) up to -50%
-            metrics[k] = max(min(v, 100.0), -50.0)
-        else:
-            metrics[k] = max(min(v, 100.0), 0.0)
+
+    # Helper functions for diminishing returns
+    def saturating_effect(value: float, alpha: float = 0.05) -> float:
+        """Return a value in [0,1] exhibiting diminishing returns.
+
+        Uses an exponential saturation curve: effect = 1 - exp(-alpha * value).
+        """
+        return 1.0 - math.exp(-alpha * value)
+
+    def optimal_effect(value: float) -> float:
+        """Return a value in [0,1] that peaks at 50% and falls off toward 0 at extremes.
+
+        Uses a sine curve to model a sweet spot: sin(pi * value/100).
+        """
+        return math.sin(math.pi * value / 100.0)
+
+    # Extract and normalize slider values (0–100)
+    def get_slider(name: str) -> float:
+        return float(sliders.get(name, 0.0))
+
+    # 1. People module (training, benefits, wellness)
+    training = get_slider("training_budget")
+    benefits = get_slider("benefits_budget")
+    wellness = get_slider("wellness_programs")
+    people_level = (training + benefits + wellness) / 3.0
+    people_effect = saturating_effect(people_level)
+    base_values["employee_satisfaction"] += 30.0 * people_effect
+    base_values["roi"] += 5.0 * people_effect
+
+    # 2. Marketing module (lead generation, social media, events)
+    lead_gen = get_slider("lead_generation")
+    social_media = get_slider("social_media")
+    events = get_slider("events")
+    marketing_level = (lead_gen * 0.6 + social_media * 0.3 + events * 0.1)
+    marketing_effect = saturating_effect(marketing_level)
+    base_values["roi"] += 50.0 * marketing_effect
+
+    # 3. Customer Support & CX module
+    support_inv = get_slider("support_investment")
+    onboarding_quality = get_slider("onboarding_quality")
+    support_effect = saturating_effect(support_inv)
+    onboarding_effect = saturating_effect(onboarding_quality)
+    # Customer satisfaction (CSAT) out of 100
+    base_values["customer_satisfaction"] += 40.0 * support_effect + 20.0 * onboarding_effect
+    base_values["customer_satisfaction"] = min(base_values["customer_satisfaction"], 100.0)
+    # NPS ranges from -100 to +100
+    base_values["nps"] += 60.0 * support_effect + 40.0 * onboarding_effect
+    base_values["nps"] = max(min(base_values["nps"], 100.0), -100.0)
+    # Churn rate decreases with better support/onboarding (cannot be <0)
+    churn_reduction = 0.8 * support_effect + 0.2 * onboarding_effect
+    base_values["churn_rate"] = max(0.0, base_values["churn_rate"] * (1.0 - churn_reduction))
+    # First response time (hours) decreases with support investment
+    response_reduction = 0.8 * support_effect
+    base_values["first_response_time"] = base_values["first_response_time"] * (1.0 - response_reduction)
+    # ROI modest boost from happier customers
+    base_values["roi"] += 3.0 * support_effect
+
+    # 4. Finance & Accounting module
+    automation_level = get_slider("financial_process_automation")
+    cost_opt_level = get_slider("cost_optimization")
+    automation_effect = saturating_effect(automation_level)
+    cost_opt_effect = saturating_effect(cost_opt_level)
+    # Net profit margin improves with automation and cost optimization
+    base_values["net_profit_margin"] += 5.0 * automation_effect + 10.0 * cost_opt_effect
+    # COGS reduction grows with cost optimization (max ~20%)
+    base_values["cogs_reduction"] += 20.0 * cost_opt_effect
+    # Budget variance decreases with automation (better planning) – lower is better
+    base_values["budget_variance"] = base_values["budget_variance"] * (1.0 - 0.8 * automation_effect)
+    # ROI increases slightly due to improved margins
+    base_values["roi"] += 4.0 * (automation_effect + cost_opt_effect)
+
+    # 5. IT Infrastructure & Security module
+    modernization_level = get_slider("it_modernization_budget")
+    cyber_level = get_slider("cybersecurity_spend")
+    modern_effect = saturating_effect(modernization_level)
+    cyber_effect = saturating_effect(cyber_level)
+    # System uptime increases with modernization, slightly decreases with heavy security overhead
+    base_values["system_uptime"] += 5.0 * modern_effect - 2.0 * cyber_effect
+    base_values["system_uptime"] = min(max(base_values["system_uptime"], 0.0), 100.0)
+    # Security incidents decrease with cybersecurity spend
+    base_values["security_incidents"] = base_values["security_incidents"] * (1.0 - 0.8 * cyber_effect)
+    # Productivity boost from modernization
+    base_values["productivity_boost"] += 20.0 * modern_effect
+    # ROI sees a small uplift from productivity gains
+    base_values["roi"] += 2.0 * modern_effect
+
+    # 6. Procurement & Supply Chain module
+    inventory_level = get_slider("inventory_optimization")
+    supplier_level = get_slider("supplier_management")
+    # Inventory turnover ratio has an optimal sweet spot at 50
+    turnover_effect = optimal_effect(inventory_level)
+    base_values["inventory_turnover_ratio"] += 4.0 * turnover_effect  # adds up to 4 times
+    # Procurement cost reduction from supplier management (max ~20%)
+    supplier_effect = saturating_effect(supplier_level)
+    base_values["procurement_cost_reduction"] += 20.0 * supplier_effect
+    # Lead time decreases as supplier management improves (cannot go <2 days)
+    base_values["lead_time"] = max(2.0, base_values["lead_time"] * (1.0 - 0.6 * supplier_effect))
+    # ROI benefits modestly from cost savings
+    base_values["roi"] += 3.0 * (turnover_effect + supplier_effect)
+
+    # Aggregate ROI adjustments from all modules (clamp between 0–100)
+    base_values["roi"] = max(min(base_values["roi"], 100.0), 0.0)
+
+    # Post‑processing: convert certain metrics to normalized 0–100 scales for dashboard
+    metrics = {}
+    # Employee satisfaction 0–100
+    metrics["employee_satisfaction"] = max(min(base_values["employee_satisfaction"], 100.0), 0.0)
+    # Customer satisfaction (CSAT) 0–100
+    metrics["customer_satisfaction"] = max(min(base_values["customer_satisfaction"], 100.0), 0.0)
+    # Net Promoter Score retains its -100 to 100 range but we include it as is
+    metrics["nps"] = base_values["nps"]
+    # Churn rate as a percentage (0–100) – lower is better
+    metrics["churn_rate"] = max(min(base_values["churn_rate"], 100.0), 0.0)
+    # First response time scaled to score (0 best, 24 worst -> 0–100 by inverse)
+    metrics["first_response_score"] = max(min(100.0 - base_values["first_response_time"] * 4.0, 100.0), 0.0)
+    # Net profit margin (can be negative up to -50)
+    metrics["net_profit_margin"] = max(min(base_values["net_profit_margin"], 100.0), -50.0)
+    # COGS reduction percentage
+    metrics["cogs_reduction"] = max(min(base_values["cogs_reduction"], 100.0), 0.0)
+    # Budget adherence score (higher is better) = 100 - variance
+    metrics["budget_adherence"] = max(min(100.0 - base_values["budget_variance"], 100.0), 0.0)
+    # System uptime percentage
+    metrics["system_uptime"] = max(min(base_values["system_uptime"], 100.0), 0.0)
+    # Security score: scale incidents to a 0–100 score (0 incidents -> 100)
+    metrics["security_score"] = max(min(100.0 - base_values["security_incidents"] * 20.0, 100.0), 0.0)
+    # Productivity boost percentage
+    metrics["productivity_boost"] = max(min(base_values["productivity_boost"], 100.0), 0.0)
+    # Inventory turnover score (ratio *10 to approximate 0–100)
+    metrics["inventory_turnover"] = max(min(base_values["inventory_turnover_ratio"] * 10.0, 100.0), 0.0)
+    # Procurement cost reduction percentage
+    metrics["procurement_cost_reduction"] = max(min(base_values["procurement_cost_reduction"], 100.0), 0.0)
+    # Lead time score (inverse of days, scaled to 0–100)
+    metrics["lead_time_score"] = max(min(100.0 - base_values["lead_time"] * 10.0, 100.0), 0.0)
+    # ROI percentage (0–100)
+    metrics["roi"] = base_values["roi"]
+
+    # Final messages list (placeholder for warnings or notes)
     messages: List[str] = []
     return SimulationResult(metrics=metrics, messages=messages)
 
