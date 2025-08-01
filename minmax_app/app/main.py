@@ -111,6 +111,47 @@ class HotSwapResult(BaseModel):
     suggestions: List[str]
 
 
+# Data models for vendors and recommendations
+class Vendor(BaseModel):
+    """Represents a service provider in the Solution Provider Index."""
+    id: int
+    name: str
+    category: str
+    description: Optional[str]
+    cost: float
+    rating: Optional[float]
+    features: Optional[str]
+    integrations: Optional[str]
+    impact: Dict[str, float]
+
+
+class VendorSummary(BaseModel):
+    """A summarized view of a vendor for listing purposes."""
+    id: int
+    name: str
+    category: str
+    cost: float
+    rating: Optional[float]
+
+
+class RecommendationInput(BaseModel):
+    """Schema for requesting tool recommendations.
+
+    Users may specify a budget (total spend available) and a mapping of
+    metric names to weights (percentages that sum to 1). An optional
+    strategy style can be provided to adjust weights. If omitted, all
+    metrics are equally weighted. Examples of metric keys include
+    'roi', 'employee_satisfaction', 'customer_satisfaction',
+    'productivity_boost', 'churn_rate'. Negative impacts (like
+    churn_rate reduction) should be given positive weight if the user
+    values reducing churn. The API normalizes weights internally.
+    """
+    budget: float
+    weights: Optional[Dict[str, float]] = None
+    strategy_style: Optional[str] = None
+    num_results: int = 3
+
+
 # Input schema for creating a new scenario version
 class ScenarioVersionInput(BaseModel):
     """Schema for creating a new version of an existing scenario.
@@ -293,12 +334,155 @@ def init_db() -> None:
     conn.commit()
     conn.close()
 
+    # Vendors table (solution provider index)
+    # This table stores information about third‑party service providers/tools
+    # available in the Solution Provider Index. Each row represents a vendor
+    # with metadata such as category, cost, rating, feature descriptions,
+    # integrations, and predicted metric impacts (stored as JSON). This
+    # marketplace is mostly global/read‑only; user‑specific actions like
+    # bookmarking live in separate tables. See design expansion for details
+    #【70839359902819†L338-L373】.
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS vendors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            description TEXT,
+            cost REAL NOT NULL,
+            rating REAL,
+            features TEXT,
+            integrations TEXT,
+            impact_json TEXT
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
 
 def get_db_connection() -> sqlite3.Connection:
     """Return a new SQLite connection with row factory set to dict-like."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def init_vendor_data() -> None:
+    """Populate the vendors table with sample data if it is empty.
+
+    The Solution Provider Index relies on having a catalog of service providers
+    that users can browse and use for recommendations【70839359902819†L338-L373】. On
+    startup we check if the table is empty and, if so, insert a handful of
+    representative vendors across the major business functions. Each vendor
+    includes predicted impacts on key metrics (ROI, engagement, churn, etc.)
+    which are used by the recommendation algorithm. In a production system,
+    this data would be sourced from APIs like G2 or manually curated and
+    updated regularly【70839359902819†L338-L373】.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) as count FROM vendors")
+    row = cur.fetchone()
+    if row and row["count"] > 0:
+        conn.close()
+        return
+    # Sample vendors with impact estimates. Impacts are expressed as percentage
+    # improvements relative to baseline (positive values increase metrics; for
+    # churn reduction negative values indicate reduction in churn rate). These
+    # numbers are illustrative and should be refined with real data.
+    sample_vendors = [
+        {
+            "name": "BambooHR",
+            "category": "HRIS",
+            "description": "All‑in‑one HR platform with employee database, PTO tracking and basic onboarding.",
+            "cost": 8.0,
+            "rating": 4.5,
+            "features": "HRIS, PTO tracking, onboarding",
+            "integrations": "Payroll add‑ons, Slack via add‑on, Greenhouse",
+            "impact": {"employee_satisfaction": 5.0, "roi": 2.0, "churn_rate": -3.0},
+        },
+        {
+            "name": "Gusto",
+            "category": "Payroll",
+            "description": "Full‑service payroll and benefits platform with onboarding checklists and compliance.",
+            "cost": 6.0,
+            "rating": 4.8,
+            "features": "Payroll processing, benefits admin, onboarding",
+            "integrations": "QuickBooks, Xero, Slack via Zapier",
+            "impact": {"employee_satisfaction": 4.0, "roi": 3.0, "churn_rate": -2.0},
+        },
+        {
+            "name": "HubSpot",
+            "category": "CRM",
+            "description": "CRM and marketing automation platform for sales and marketing alignment.",
+            "cost": 50.0,
+            "rating": 4.4,
+            "features": "Contact management, email marketing, lead scoring",
+            "integrations": "Gmail, Slack, Shopify, Salesforce",
+            "impact": {"roi": 10.0, "customer_satisfaction": 5.0, "churn_rate": -4.0},
+        },
+        {
+            "name": "Asana",
+            "category": "Project Management",
+            "description": "Project and task management platform to improve team collaboration and productivity.",
+            "cost": 10.0,
+            "rating": 4.6,
+            "features": "Task tracking, dashboards, integrations",
+            "integrations": "Slack, Google Workspace, Zapier",
+            "impact": {"productivity_boost": 8.0, "roi": 4.0, "churn_rate": -1.0},
+        },
+        {
+            "name": "QuickBooks Online",
+            "category": "Accounting",
+            "description": "Cloud accounting platform for small and mid‑sized businesses.",
+            "cost": 30.0,
+            "rating": 4.7,
+            "features": "Bookkeeping, invoicing, reporting",
+            "integrations": "Gusto, HubSpot, Shopify",
+            "impact": {"net_profit_margin": 3.0, "roi": 2.0},
+        },
+        {
+            "name": "Slack",
+            "category": "Collaboration",
+            "description": "Team communication tool with channels, messaging and integrations.",
+            "cost": 6.0,
+            "rating": 4.8,
+            "features": "Messaging, file sharing, video calls",
+            "integrations": "Gusto, HubSpot, Asana, Zapier",
+            "impact": {"productivity_boost": 5.0, "employee_satisfaction": 3.0},
+        },
+        {
+            "name": "Monday.com",
+            "category": "Project Management",
+            "description": "Work operating system for managing projects, tasks and workflows.",
+            "cost": 12.0,
+            "rating": 4.5,
+            "features": "Boards, automations, dashboards",
+            "integrations": "Slack, Google Workspace, Salesforce",
+            "impact": {"productivity_boost": 7.0, "roi": 3.0, "employee_satisfaction": 1.0},
+        },
+    ]
+    for vendor in sample_vendors:
+        import json
+        cur.execute(
+            "INSERT INTO vendors (name, category, description, cost, rating, features, integrations, impact_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                vendor["name"],
+                vendor["category"],
+                vendor["description"],
+                vendor["cost"],
+                vendor["rating"],
+                vendor["features"],
+                vendor["integrations"],
+                json.dumps(vendor["impact"]),
+            ),
+        )
+    conn.commit()
+    conn.close()
 
 
 def hash_password(password: str, salt: str) -> str:
@@ -463,6 +647,12 @@ def get_calibration_params(org_id: int) -> Dict[str, float]:
 # to call init_db() multiple times because the CREATE TABLE commands
 # use IF NOT EXISTS clauses.
 init_db()
+
+# Populate the vendors table with initial sample data if needed. This call
+# inserts a curated set of service providers for the Solution Provider
+# Index. It is safe to call multiple times because it checks whether
+# the table already contains entries before inserting new ones.
+init_vendor_data()
 
 
 
@@ -1601,6 +1791,414 @@ def restore_scenario(
         "restored_from": payload.version,
         "new_version": next_version,
     }
+
+################################################################################
+# Vendor Marketplace and Recommendations
+################################################################################
+
+from typing import Tuple
+
+def fetch_vendors(
+    conn: sqlite3.Connection,
+    category: Optional[str] = None,
+    search: Optional[str] = None,
+    min_cost: Optional[float] = None,
+    max_cost: Optional[float] = None,
+    min_rating: Optional[float] = None,
+    limit: Optional[int] = None,
+    sort_by: Optional[str] = None,
+    sort_order: str = "asc",
+) -> List[sqlite3.Row]:
+    """Return a list of vendor rows filtered by the provided criteria.
+
+    This helper executes a SELECT query against the vendors table,
+    applying optional filters on category, search substring, cost range and rating.
+    Sorting may be requested on cost or rating in ascending or descending order.
+    """
+    query = "SELECT * FROM vendors WHERE 1=1"
+    params: List[Any] = []
+    if category:
+        query += " AND category = ?"
+        params.append(category)
+    if search:
+        query += " AND (LOWER(name) LIKE ? OR LOWER(description) LIKE ?)"
+        term = f"%{search.lower()}%"
+        params.extend([term, term])
+    if min_cost is not None:
+        query += " AND cost >= ?"
+        params.append(min_cost)
+    if max_cost is not None:
+        query += " AND cost <= ?"
+        params.append(max_cost)
+    if min_rating is not None:
+        query += " AND (rating IS NOT NULL AND rating >= ?)"
+        params.append(min_rating)
+    # Sorting
+    if sort_by in {"cost", "rating"}:
+        order = "DESC" if sort_order == "desc" else "ASC"
+        query += f" ORDER BY {sort_by} {order}"
+    # Limit
+    if limit:
+        query += " LIMIT ?"
+        params.append(limit)
+    cur = conn.cursor()
+    cur.execute(query, tuple(params))
+    return cur.fetchall()
+
+
+@app.get("/vendors", response_model=List[VendorSummary])
+def list_vendors(
+    category: Optional[str] = None,
+    search: Optional[str] = None,
+    min_cost: Optional[float] = None,
+    max_cost: Optional[float] = None,
+    min_rating: Optional[float] = None,
+    limit: int = 20,
+    sort_by: Optional[str] = None,
+    sort_order: str = "asc",
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> List[VendorSummary]:
+    """List vendors from the Solution Provider Index with optional filters.
+
+    Supports filtering by category, searching by name/description, cost range,
+    minimum rating, and sorting by cost or rating. Users must be authenticated,
+    but there is no role restriction. Audit entries are recorded.
+    """
+    conn = get_db_connection()
+    rows = fetch_vendors(conn, category, search, min_cost, max_cost, min_rating, limit, sort_by, sort_order)
+    conn.close()
+    vendors: List[VendorSummary] = []
+    for row in rows:
+        vendors.append(
+            VendorSummary(
+                id=row["id"],
+                name=row["name"],
+                category=row["category"],
+                cost=row["cost"],
+                rating=row["rating"],
+            )
+        )
+    # Audit
+    log_audit_event(
+        current_user["id"],
+        current_user["org_id"],
+        "vendors_list",
+        details=f"Listed vendors (category={category}, search={search})",
+    )
+    return vendors
+
+
+@app.get("/vendors/{vendor_id}", response_model=Vendor)
+def get_vendor(
+    vendor_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Vendor:
+    """Retrieve full details for a vendor by ID.
+
+    Returns all metadata including description, features, integrations
+    and impact estimates. Raises 404 if not found. Audit entry is recorded.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM vendors WHERE id = ?", (vendor_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vendor not found")
+    import json
+    impact = json.loads(row["impact_json"]) if row["impact_json"] else {}
+    vendor = Vendor(
+        id=row["id"],
+        name=row["name"],
+        category=row["category"],
+        description=row["description"],
+        cost=row["cost"],
+        rating=row["rating"],
+        features=row["features"],
+        integrations=row["integrations"],
+        impact=impact,
+    )
+    # Audit
+    log_audit_event(
+        current_user["id"],
+        current_user["org_id"],
+        "vendor_detail",
+        details=f"Viewed vendor {vendor_id}",
+    )
+    return vendor
+
+
+@app.get("/vendor_categories", response_model=List[str])
+def list_vendor_categories(current_user: Dict[str, Any] = Depends(get_current_user)) -> List[str]:
+    """Return a list of distinct vendor categories.
+
+    This endpoint can be used to build UI filters and navigation. Audit is recorded.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT category FROM vendors ORDER BY category ASC")
+    categories = [row["category"] for row in cur.fetchall()]
+    conn.close()
+    # Audit
+    log_audit_event(
+        current_user["id"],
+        current_user["org_id"],
+        "vendor_categories",
+        details="Listed vendor categories",
+    )
+    return categories
+
+
+def _compute_baseline_factors(calibrations: Dict[str, float]) -> Dict[str, float]:
+    """Compute weighting factors based on calibration baselines.
+
+    For metrics on a 0–100 scale higher is better, the factor is (100 - baseline) / 100
+    so that higher baselines reduce the potential benefit. For metrics where
+    lower is better (e.g. churn_rate), the factor is baseline / 100 to
+    indicate more room for improvement at higher churn. Unknown metrics
+    default to 1.0 (no adjustment).
+    """
+    factors: Dict[str, float] = {}
+    for metric in ["employee_satisfaction", "customer_satisfaction", "nps", "churn_rate",
+                   "first_response_score", "net_profit_margin", "cogs_reduction",
+                   "budget_adherence", "system_uptime", "security_score",
+                   "productivity_boost", "inventory_turnover", "procurement_cost_reduction",
+                   "lead_time_score", "roi"]:
+        baseline_param = f"baseline_{metric}"
+        baseline = calibrations.get(baseline_param)
+        if baseline is None:
+            factors[metric] = 1.0
+        else:
+            if metric == "churn_rate":
+                # Lower churn is better; factor increases with baseline
+                factors[metric] = float(baseline) / 100.0
+            else:
+                factors[metric] = (100.0 - float(baseline)) / 100.0
+    return factors
+
+
+@app.post("/recommendations", response_model=RecommendationResult)
+def recommend_vendors(
+    payload: RecommendationInput,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> RecommendationResult:
+    """Provide tool recommendations based on user‑specified weights and budget.
+
+    The recommendation algorithm scores vendors by summing the weighted
+    improvements of their metric impacts. Weights are normalized if provided;
+    if no weights are given, all metrics present in vendor impacts receive
+    equal weight. Calibration baselines adjust the weight of each metric
+    so that metrics where the organization is already performing well
+    contribute less to the score【644198553755745†L1715-L1747】. Only vendors within the
+    specified budget are considered. The top ``num_results`` vendors are
+    returned along with a textual rationale.
+    """
+    # Load vendor catalog
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM vendors")
+    vendor_rows = cur.fetchall()
+    conn.close()
+    if not vendor_rows:
+        return RecommendationResult(recommendations=[], rationale="No vendors available.")
+    # Normalize weights
+    weights: Dict[str, float] = {}
+    if payload.weights:
+        total_weight = sum(abs(w) for w in payload.weights.values()) or 1.0
+        for metric, weight in payload.weights.items():
+            weights[metric] = abs(weight) / total_weight
+    # Retrieve calibration baselines for factor adjustment
+    calibrations = get_calibration_params(current_user["org_id"])
+    baseline_factors = _compute_baseline_factors(calibrations)
+    # Score vendors
+    scored: List[Tuple[float, sqlite3.Row]] = []
+    import json
+    for row in vendor_rows:
+        if payload.budget is not None and row["cost"] > payload.budget:
+            continue
+        impact = json.loads(row["impact_json"]) if row["impact_json"] else {}
+        # Determine which metrics to consider
+        if weights:
+            relevant_metrics = weights.keys()
+        else:
+            relevant_metrics = impact.keys()
+            # assign equal weight to each
+            if relevant_metrics:
+                weights = {m: 1.0 / len(relevant_metrics) for m in relevant_metrics}
+        # compute score
+        score = 0.0
+        for metric in impact:
+            if metric not in weights:
+                continue
+            improvement = float(impact[metric])
+            weight = weights[metric]
+            factor = baseline_factors.get(metric, 1.0)
+            score += improvement * weight * factor
+        # If the vendor has no relevant metrics, skip
+        if score == 0.0:
+            continue
+        # Optionally adjust for cost or rating later; for now just use the improvement
+        scored.append((score, row))
+    # Sort by score descending
+    scored.sort(key=lambda tup: tup[0], reverse=True)
+    # Limit to requested number of results
+    num = max(1, payload.num_results)
+    top = scored[:num]
+    recommended_names: List[str] = [row["name"] for _, row in top]
+    # Build rationale: highlight which metrics contributed most
+    rationale_parts: List[str] = []
+    if not top:
+        rationale = "No recommendations match your criteria."
+    else:
+        rationale_parts.append("Top recommendations were selected based on weighted metric improvements and your organization's calibration.")
+        for score, row in top:
+            impact = json.loads(row["impact_json"]) if row["impact_json"] else {}
+            details = []
+            for metric, val in impact.items():
+                if metric in weights:
+                    details.append(f"{metric} {val:+.1f}%")
+            rationale_parts.append(f"{row['name']}: {'; '.join(details)}")
+        rationale = " ".join(rationale_parts)
+    # Audit
+    log_audit_event(
+        current_user["id"],
+        current_user["org_id"],
+        "recommendations",
+        details=f"Generated {len(recommended_names)} recommendations within budget {payload.budget}",
+    )
+    return RecommendationResult(recommendations=recommended_names, rationale=rationale)
+
+
+class HotSwapInput(BaseModel):
+    """Input schema for performing a hot‑swap analysis on the current tech stack.
+
+    ``current_stack`` should be a list of vendor names currently in use. The
+    analysis examines integration gaps, missing capabilities, and potential
+    performance improvements based on the organization's calibration data.
+    An optional budget can be provided to limit recommended replacements.
+    """
+    current_stack: List[str]
+    budget: Optional[float] = None
+
+
+@app.post("/hot_swap", response_model=HotSwapResult)
+def perform_hot_swap(
+    payload: HotSwapInput,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> HotSwapResult:
+    """Analyze the user's current tech stack and suggest additions or replacements.
+
+    The hot‑swap analysis examines the features and impacts of the current
+    providers against the organization's calibrated metrics. It identifies
+    missing capabilities (categories not represented in the stack), potential
+    performance gaps (metrics with low baselines and no vendors improving them),
+    simple integration issues (no overlapping integrations), and budget
+    misalignment (vendors that are significantly more expensive than peers).
+    It then recommends one or two vendors from the index to fill gaps or
+    replace underperforming tools【544729577495327†L33-L99】.
+    """
+    import json
+    # Build a set of vendor names from the current stack for lookup
+    stack_set = {name.lower() for name in payload.current_stack}
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM vendors")
+    all_vendors = cur.fetchall()
+    conn.close()
+    # Determine which vendors are in the stack
+    current_vendors: List[sqlite3.Row] = [row for row in all_vendors if row["name"].lower() in stack_set]
+    # Identify categories currently covered
+    covered_categories = {row["category"] for row in current_vendors}
+    # Identify missing categories: categories present in catalog but not in stack
+    all_categories = {row["category"] for row in all_vendors}
+    missing_categories = sorted(list(all_categories - covered_categories))
+    # Identify performance gaps based on calibration baselines
+    calibrations = get_calibration_params(current_user["org_id"])
+    baseline_factors = _compute_baseline_factors(calibrations)
+    # For metrics with factor > 0.5 (indicating significant room for improvement) and
+    # no vendor in the stack impacting that metric, mark as gap.
+    gaps: List[str] = []
+    for metric, factor in baseline_factors.items():
+        if factor > 0.5:
+            # check if any current vendor improves this metric
+            improved = False
+            for v in current_vendors:
+                impact = json.loads(v["impact_json"]) if v["impact_json"] else {}
+                if metric in impact and impact[metric] != 0:
+                    improved = True
+                    break
+            if not improved:
+                gaps.append(metric)
+    # Identify simple integration issues: if two or more stack tools have no integrations in common
+    integration_issues: List[str] = []
+    # Build integration sets for each vendor
+    vendor_integrations = []
+    for v in current_vendors:
+        integrations = set()
+        if v["integrations"]:
+            integrations = {s.strip().lower() for s in v["integrations"].split(",")}
+        vendor_integrations.append(integrations)
+    # Check pairwise intersection
+    for i in range(len(vendor_integrations)):
+        for j in range(i + 1, len(vendor_integrations)):
+            if vendor_integrations[i] and vendor_integrations[j] and vendor_integrations[i].isdisjoint(vendor_integrations[j]):
+                integration_issues.append(
+                    f"{current_vendors[i]['name']} and {current_vendors[j]['name']} have no shared integrations"
+                )
+    # Identify budget misalignment: if any vendor's cost > budget (if provided)
+    budget_misalignment: List[str] = []
+    if payload.budget is not None:
+        for v in current_vendors:
+            if v["cost"] > payload.budget:
+                budget_misalignment.append(f"{v['name']} exceeds budget")
+    # Suggest replacements/additions: for each missing category or gap, pick top vendor impacting that metric
+    suggestions: List[str] = []
+    # For missing categories, pick highest rated vendor from that category within budget
+    for cat in missing_categories:
+        # filter vendors by category and cost
+        candidates = [row for row in all_vendors if row["category"] == cat]
+        if payload.budget is not None:
+            candidates = [row for row in candidates if row["cost"] <= payload.budget]
+        if not candidates:
+            continue
+        # sort by rating descending
+        candidates.sort(key=lambda r: (r["rating"] or 0.0), reverse=True)
+        suggestions.append(f"Add {candidates[0]['name']} to cover category {cat}")
+    # For performance gaps, pick vendor with highest impact on that metric
+    for metric in gaps:
+        # Among vendors not in current stack, find the one with max impact on that metric
+        best_row = None
+        best_impact = 0.0
+        for v in all_vendors:
+            if v["name"].lower() in stack_set:
+                continue
+            impact = json.loads(v["impact_json"]) if v["impact_json"] else {}
+            if metric in impact:
+                val = float(impact[metric])
+                # use absolute improvement for ranking
+                if val > best_impact:
+                    # consider budget
+                    if payload.budget is None or v["cost"] <= payload.budget:
+                        best_impact = val
+                        best_row = v
+        if best_row:
+            suggestions.append(f"Consider {best_row['name']} to improve {metric}")
+    # Limit suggestions to 5 to avoid overwhelming the user
+    suggestions = suggestions[:5]
+    # Audit
+    log_audit_event(
+        current_user["id"],
+        current_user["org_id"],
+        "hot_swap",
+        details=f"Performed hot swap analysis on stack of {len(payload.current_stack)} vendors",
+    )
+    return HotSwapResult(
+        missing_capabilities=missing_categories,
+        performance_gaps=gaps,
+        integration_issues=integration_issues,
+        budget_misalignment=budget_misalignment,
+        suggestions=suggestions,
+    )
 
 
 ################################################################################
