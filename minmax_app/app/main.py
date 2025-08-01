@@ -333,6 +333,26 @@ def init_db() -> None:
     )
     conn.commit()
     conn.close()
+    # Streaks table
+    # Stores per-user streak state for weekly check-ins. ``streak_count``
+    # counts the number of consecutive weeks the user has checked in, and
+    # ``last_checkin_date`` stores the date of their most recent check-in.
+    # Each row's user_id is a foreign key to the users table. This table
+    # supports the "Streak Manager" described in the specification【644198553755745†L638-L677】.
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_streaks (
+            user_id INTEGER PRIMARY KEY,
+            streak_count INTEGER NOT NULL,
+            last_checkin_date TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
 
     # Vendors table (solution provider index)
     # This table stores information about third‑party service providers/tools
@@ -704,6 +724,8 @@ def init_gamification() -> None:
         ("calibration_first", "First Calibration", "Upload your first calibration dataset", 20),
         ("recommendations_first", "First Recommendations", "Request recommendations for the first time", 20),
         ("hot_swap_first", "First Hot Swap", "Perform your first hot swap analysis", 30),
+        ("weekly_streak_4", "Weekly Habit Beginner", "Check in weekly for 4 consecutive weeks", 50),
+        ("weekly_streak_8", "Weekly Habit Pro", "Check in weekly for 8 consecutive weeks", 100),
     ]
     for key, name, description, xp_reward in achievements:
         cur.execute(
@@ -807,6 +829,66 @@ def process_gamification_event(user_id: int, org_id: int, event: str) -> None:
         award_xp(user_id, org_id, xp_amount)
     if achievement_key:
         award_achievement(user_id, org_id, achievement_key)
+
+    # Special handling for weekly check-ins (streaks)
+    if event == "weekly_check_in":
+        _update_weekly_streak(user_id, org_id)
+
+
+def _update_weekly_streak(user_id: int, org_id: int) -> None:
+    """Update a user's weekly streak based on the current date.
+
+    A weekly streak increments when the user checks in within 7 days of
+    their previous check-in. If more than 7 days have elapsed, the
+    streak resets to 1. This function also awards streak-related
+    achievements when thresholds are reached (4 and 8 weeks) and grants
+    a small XP boost for each check-in. The streak state is stored in
+    the ``user_streaks`` table.【644198553755745†L638-L677】
+    """
+    today = _dt.datetime.utcnow().date()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Fetch current streak state
+    cur.execute(
+        "SELECT streak_count, last_checkin_date FROM user_streaks WHERE user_id = ?",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    if row:
+        last_date = _dt.date.fromisoformat(row["last_checkin_date"])
+        streak_count = row["streak_count"]
+        # If check-in already recorded today, do nothing
+        if last_date == today:
+            conn.close()
+            return
+        days_diff = (today - last_date).days
+        if 0 < days_diff <= 7:
+            # increment streak
+            new_streak = streak_count + 1
+        else:
+            # reset streak
+            new_streak = 1
+        # Update row
+        cur.execute(
+            "UPDATE user_streaks SET streak_count = ?, last_checkin_date = ? WHERE user_id = ?",
+            (new_streak, today.isoformat(), user_id),
+        )
+    else:
+        # create new streak entry
+        new_streak = 1
+        cur.execute(
+            "INSERT INTO user_streaks (user_id, streak_count, last_checkin_date) VALUES (?, ?, ?)",
+            (user_id, 1, today.isoformat()),
+        )
+    conn.commit()
+    conn.close()
+    # Award XP for weekly check-in (5 XP)
+    award_xp(user_id, org_id, 5)
+    # Award streak achievements
+    if new_streak >= 8:
+        award_achievement(user_id, org_id, "weekly_streak_8")
+    elif new_streak >= 4:
+        award_achievement(user_id, org_id, "weekly_streak_4")
 
 
 # Ensure the database schema is created on module import. This call
@@ -989,6 +1071,8 @@ def login(payload: UserLoginRequest) -> Dict[str, str]:
     token = create_session(user_id)
     # Log the login event
     log_audit_event(user_id, org_id, "login", details=f"User {payload.username} logged in")
+    # Gamification: update weekly streak on login
+    process_gamification_event(user_id, org_id, "weekly_check_in")
     return {"token": token}
 
 
@@ -2506,6 +2590,39 @@ def get_leaderboard(
         details=f"Viewed leaderboard (scope={scope})",
     )
     return leaderboard
+
+
+@app.get("/streak")
+def get_streak(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """Return the current user's weekly streak status.
+
+    Provides the number of consecutive weeks the user has checked in and
+    the date of their last check-in. If the user has never checked in,
+    returns a streak of 0 and null for the date. An audit entry is
+    recorded when viewed.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT streak_count, last_checkin_date FROM user_streaks WHERE user_id = ?",
+        (current_user["id"],),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        streak_count = row["streak_count"]
+        last_date = row["last_checkin_date"]
+    else:
+        streak_count = 0
+        last_date = None
+    # Audit
+    log_audit_event(
+        current_user["id"],
+        current_user["org_id"],
+        "streak_view",
+        details="Viewed streak status",
+    )
+    return {"streak_count": streak_count, "last_checkin_date": last_date}
 
 
 ################################################################################
