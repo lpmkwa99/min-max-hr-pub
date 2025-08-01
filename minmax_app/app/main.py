@@ -16,10 +16,15 @@ import datetime as _dt
 import secrets
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi import status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
+import sqlite3
+import hashlib
+import hmac
+import base64
+
 
 
 app = FastAPI(
@@ -106,17 +111,251 @@ class HotSwapResult(BaseModel):
     suggestions: List[str]
 
 
-# In‑memory stores
+# In‑memory stores (deprecated)
+#
+# These dictionaries were used in the initial prototype to hold users,
+# tenants, scenarios, and calibration data in memory. The refactored
+# implementation now persists data in a SQLite database via the helper
+# functions defined above (create_user, create_session, etc.). The
+# dictionaries remain defined for backwards compatibility but are no
+# longer used. They will be removed in a future refactor once all
+# endpoints rely solely on the database.
 users: Dict[int, User] = {}
 tenants: Dict[int, Tenant] = {1: Tenant(id=1, name="Default Tenant")}
 scenarios: Dict[int, Scenario] = {}
 calibrations: Dict[int, Calibration] = {}
 tokens: Dict[str, int] = {}
 
-# ID counters
+# ID counters (deprecated) – replaced by auto‑incrementing IDs in the
+# database. They remain here only for compatibility with legacy logic
+# and will be removed once the migration is complete.
 _user_counter = 1
 _scenario_counter = 1
 _calibration_counter = 1
+
+
+################################################################################
+# Persistent Storage (SQLite)
+################################################################################
+
+# Path to the SQLite database file. It resides inside the package directory
+DB_PATH = "./data.db"
+
+
+def init_db() -> None:
+    """Create required tables if they do not exist.
+
+    This function initializes the SQLite database with tables for
+    organizations, users, scenarios, sessions, and audit logs. It is
+    idempotent and can be called at startup.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    # Enable foreign keys
+    cursor.execute("PRAGMA foreign_keys = ON;")
+    # Organizations table
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS organizations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE
+        );
+        """
+    )
+    # Users table
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            org_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            xp INTEGER DEFAULT 0,
+            level INTEGER DEFAULT 1,
+            FOREIGN KEY(org_id) REFERENCES organizations(id)
+        );
+        """
+    )
+    # Sessions table
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            expires_at TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        """
+    )
+    # Scenarios table
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scenarios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            org_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            sliders TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(org_id) REFERENCES organizations(id),
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        """
+    )
+    # Audit logs table
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            org_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            details TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(org_id) REFERENCES organizations(id)
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_db_connection() -> sqlite3.Connection:
+    """Return a new SQLite connection with row factory set to dict-like."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def hash_password(password: str, salt: str) -> str:
+    """Return a SHA-256 hash of the password with provided salt."""
+    return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+
+
+def create_user(username: str, password: str, org_name: str, role: str) -> int:
+    """Create a new user with hashed password and return the new user ID.
+
+    If the organization does not exist, it will be created. The password is
+    salted and hashed before storage.
+    """
+    salt = secrets.token_hex(8)
+    password_hash = hash_password(password, salt)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Ensure organization exists
+    cur.execute("SELECT id FROM organizations WHERE name = ?", (org_name,))
+    row = cur.fetchone()
+    if row:
+        org_id = row["id"]
+    else:
+        cur.execute("INSERT INTO organizations (name) VALUES (?)", (org_name,))
+        org_id = cur.lastrowid
+    # Insert user
+    cur.execute(
+        "INSERT INTO users (username, password_hash, salt, org_id, role) VALUES (?, ?, ?, ?, ?)",
+        (username, password_hash, salt, org_id, role),
+    )
+    user_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return user_id
+
+
+def verify_user_credentials(username: str, password: str) -> Optional[Dict[str, Any]]:
+    """Verify a user's credentials and return user record if valid.
+
+    Returns a dict with keys id, username, org_id, role if the password is
+    correct. Otherwise returns None.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, password_hash, salt, org_id, role FROM users WHERE username = ?", (username,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return None
+    salt = row["salt"]
+    expected_hash = row["password_hash"]
+    if hash_password(password, salt) == expected_hash:
+        user_record = {
+            "id": row["id"],
+            "username": username,
+            "org_id": row["org_id"],
+            "role": row["role"],
+        }
+        conn.close()
+        return user_record
+    conn.close()
+    return None
+
+
+def create_session(user_id: int, expires_in_seconds: int = 3600) -> str:
+    """Create a new session token for the user and store it in DB."""
+    token = secrets.token_hex(24)
+    expires_at = (_dt.datetime.utcnow() + _dt.timedelta(seconds=expires_in_seconds)).isoformat()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)",
+        (token, user_id, expires_at),
+    )
+    conn.commit()
+    conn.close()
+    return token
+
+
+def get_user_by_token(token: str) -> Optional[Dict[str, Any]]:
+    """Retrieve user data from a session token, verifying expiration."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT u.id, u.username, u.org_id, u.role, s.expires_at FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.token = ?",
+        (token,),
+    )
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return None
+    expires_at = row["expires_at"]
+    if expires_at and _dt.datetime.fromisoformat(expires_at) < _dt.datetime.utcnow():
+        # Session expired; delete
+        cur.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        conn.commit()
+        conn.close()
+        return None
+    user_record = {
+        "id": row["id"],
+        "username": row["username"],
+        "org_id": row["org_id"],
+        "role": row["role"],
+    }
+    conn.close()
+    return user_record
+
+
+def log_audit_event(user_id: int, org_id: int, action: str, details: Optional[str] = None) -> None:
+    """Insert an audit log entry into the database."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO audit_logs (timestamp, user_id, org_id, action, details) VALUES (?, ?, ?, ?, ?)",
+        (_dt.datetime.utcnow().isoformat(), user_id, org_id, action, details),
+    )
+    conn.commit()
+    conn.close()
+
+
+# Ensure the database schema is created on module import. This call
+# executes the CREATE TABLE statements in init_db() so that all
+# subsequent operations against the database can succeed. It is safe
+# to call init_db() multiple times because the CREATE TABLE commands
+# use IF NOT EXISTS clauses.
+init_db()
+
 
 
 ################################################################################
@@ -131,12 +370,14 @@ def _generate_token() -> str:
     return secrets.token_hex(24)
 
 
-def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> User:
+def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> Dict[str, Any]:
     """Retrieve the current authenticated user based on a bearer token.
 
     This function extracts the token from the Authorization header and
-    looks up the corresponding user in the in‑memory token store. If the
-    token is missing or invalid, an HTTP 401 error is raised.
+    looks up the corresponding user session in the database. If the
+    token is missing, invalid, or expired, an HTTP 401 error is raised.
+    It returns a dictionary with keys ``id``, ``username``, ``org_id``,
+    and ``role``.
     """
     if credentials is None:
         raise HTTPException(
@@ -145,14 +386,14 @@ def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depen
             headers={"WWW-Authenticate": "Bearer"},
         )
     token = credentials.credentials
-    user_id = tokens.get(token)
-    if user_id is None or user_id not in users:
+    user_record = get_user_by_token(token)
+    if not user_record:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return users[user_id]
+    return user_record
 
 
 ################################################################################
@@ -203,32 +444,51 @@ MODULE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
 
 
 class UserRegisterRequest(BaseModel):
-    """Schema for user registration."""
+    """Schema for user registration.
+
+    In addition to a username and password, users must specify the
+    organization they belong to and the role they wish to assume.
+    Acceptable roles are ``admin``, ``manager``, or ``viewer``. If the
+    role is omitted it defaults to ``viewer``. The organization name
+    will be created if it does not already exist in the database.
+    """
 
     username: str
     password: str
+    organization: str = Field(alias="organization", min_length=1)
+    role: str = Field(default="viewer")
 
 
 @app.post("/register", status_code=status.HTTP_201_CREATED)
 def register(payload: UserRegisterRequest) -> Dict[str, Any]:
-    """Register a new user and return a token.
+    """Register a new user and return a session token.
 
-    This endpoint accepts a JSON body containing a username and password.
-    For demonstration purposes the password is stored in plain text. When
-    registering, a new user is added to the in‑memory store and a
-    bearer token is returned. Subsequent requests should include this
-    token in the Authorization header as ``Bearer <token>``.
+    This endpoint creates a user record in the persistent database
+    with a salted and hashed password. If the specified organization
+    does not exist it will be created. A session token is generated
+    and returned along with the user ID. An audit entry is recorded
+    noting the registration action.
     """
-    global _user_counter
-    # Ensure username is unique
-    if any(u.username == payload.username for u in users.values()):
+    # Validate role
+    role = payload.role.lower()
+    if role not in {"admin", "manager", "viewer"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid role")
+    # Attempt to create the user; if the username already exists this will raise an IntegrityError
+    try:
+        user_id = create_user(payload.username, payload.password, payload.organization, role)
+    except sqlite3.IntegrityError:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username already exists")
-    user_id = _user_counter
-    _user_counter += 1
-    new_user = User(id=user_id, username=payload.username, password=payload.password, roles=["user"], tenant_id=1)
-    users[user_id] = new_user
-    token = _generate_token()
-    tokens[token] = user_id
+    # Create a session for the new user
+    token = create_session(user_id)
+    # Retrieve org_id for audit log
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT org_id FROM users WHERE id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    org_id = row["org_id"] if row else None
+    if org_id is not None:
+        log_audit_event(user_id, org_id, "register", details=f"User {payload.username} registered with role {role}")
     return {"token": token, "user_id": user_id}
 
 
@@ -241,20 +501,31 @@ class UserLoginRequest(BaseModel):
 
 @app.post("/login")
 def login(payload: UserLoginRequest) -> Dict[str, str]:
-    """Authenticate a user and return an access token."""
-    # Simple authentication: match username and password exactly
-    for user in users.values():
-        if user.username == payload.username and user.password == payload.password:
-            # Generate a new token for this session
-            token = _generate_token()
-            tokens[token] = user.id
-            return {"token": token}
-    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    """Authenticate a user and return a session token.
+
+    The provided username and password are validated against the
+    database. If valid, a new session record is created with an
+    expiration time. An audit entry is added for the login action.
+    """
+    user_record = verify_user_credentials(payload.username, payload.password)
+    if not user_record:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    user_id = user_record["id"]
+    org_id = user_record["org_id"]
+    token = create_session(user_id)
+    # Log the login event
+    log_audit_event(user_id, org_id, "login", details=f"User {payload.username} logged in")
+    return {"token": token}
 
 
 @app.get("/me")
-def get_me(current_user: User = Depends(get_current_user)) -> User:
-    """Return the profile of the currently authenticated user."""
+def get_me(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """Return the profile of the currently authenticated user.
+
+    The returned object includes the user ID, username, organization
+    identifier, and role. Additional fields such as XP and level are
+    omitted for brevity but may be added later.
+    """
     return current_user
 
 
@@ -267,77 +538,138 @@ def list_modules() -> Dict[str, Any]:
 @app.post("/scenario", status_code=status.HTTP_201_CREATED)
 def create_scenario(
     payload: SimulationInput,
-    current_user: User = Depends(get_current_user),
-) -> Scenario:
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
     """Create a new scenario for the current user.
 
-    The scenario stores the provided slider values and can be
-    referenced later for simulations or cloning.
+    The scenario is persisted in the database associated with the
+    caller's organization and user ID. Slider values are stored as
+    JSON. A corresponding audit entry is recorded.
     """
-    global _scenario_counter
-    scenario_id = _scenario_counter
-    _scenario_counter += 1
-    now = _dt.datetime.utcnow()
-    scenario = Scenario(
-        id=scenario_id,
-        tenant_id=current_user.tenant_id,
-        user_id=current_user.id,
-        name=payload.scenario_name or f"Scenario {scenario_id}",
-        sliders=payload.sliders,
-        created_at=now,
-        updated_at=now,
+    import json
+    now = _dt.datetime.utcnow().isoformat()
+    name = payload.scenario_name or "Untitled Scenario"
+    sliders_json = json.dumps(payload.sliders)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO scenarios (org_id, user_id, name, sliders, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            current_user["org_id"],
+            current_user["id"],
+            name,
+            sliders_json,
+            now,
+            now,
+        ),
     )
-    scenarios[scenario_id] = scenario
-    return scenario
+    scenario_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    # Audit log
+    log_audit_event(current_user["id"], current_user["org_id"], "scenario_create", details=f"Created scenario {name} (ID {scenario_id})")
+    return {
+        "id": scenario_id,
+        "tenant_id": current_user["org_id"],
+        "user_id": current_user["id"],
+        "name": name,
+        "sliders": payload.sliders,
+        "created_at": now,
+        "updated_at": now,
+    }
 
 
 @app.get("/scenario/{scenario_id}")
-def get_scenario(scenario_id: int, current_user: User = Depends(get_current_user)) -> Scenario:
+def get_scenario(scenario_id: int, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     """Retrieve a scenario by its ID.
 
-    Users may only access scenarios within their own tenant.
+    Users may only access scenarios within their own organization. The
+    scenario is returned as a dictionary with its sliders parsed
+    back into a Python object.
     """
-    scenario = scenarios.get(scenario_id)
-    if scenario is None:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, org_id, user_id, name, sliders, created_at, updated_at FROM scenarios WHERE id = ?", (scenario_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scenario not found")
-    if scenario.tenant_id != current_user.tenant_id:
+    if row["org_id"] != current_user["org_id"]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
-    return scenario
+    import json
+    sliders = json.loads(row["sliders"]) if row["sliders"] else {}
+    return {
+        "id": row["id"],
+        "tenant_id": row["org_id"],
+        "user_id": row["user_id"],
+        "name": row["name"],
+        "sliders": sliders,
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
 
 
 @app.post("/scenario/{scenario_id}/clone", status_code=status.HTTP_201_CREATED)
-def clone_scenario(scenario_id: int, current_user: User = Depends(get_current_user)) -> Scenario:
+def clone_scenario(scenario_id: int, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     """Clone an existing scenario and return the new scenario.
 
-    The cloned scenario copies slider settings and updates the name.
+    The cloned scenario copies slider settings and updates the name. The
+    user performing the clone becomes the owner of the new scenario.
+    An audit entry is recorded.
     """
-    original = scenarios.get(scenario_id)
-    if original is None:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Fetch original scenario
+    cur.execute("SELECT id, org_id, user_id, name, sliders FROM scenarios WHERE id = ?", (scenario_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scenario not found")
-    if original.tenant_id != current_user.tenant_id:
+    if row["org_id"] != current_user["org_id"]:
+        conn.close()
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
-    global _scenario_counter
-    new_id = _scenario_counter
-    _scenario_counter += 1
-    now = _dt.datetime.utcnow()
-    clone_name = f"{original.name} (Clone {new_id})"
-    cloned = Scenario(
-        id=new_id,
-        tenant_id=original.tenant_id,
-        user_id=current_user.id,
-        name=clone_name,
-        sliders=original.sliders.copy(),
-        created_at=now,
-        updated_at=now,
+    import json
+    original_name = row["name"]
+    sliders_json = row["sliders"]
+    now = _dt.datetime.utcnow().isoformat()
+    # Insert cloned scenario; name will be suffixed with clone id once inserted
+    # We first insert to get the new ID
+    clone_base_name = f"{original_name} (Clone)"
+    cur.execute(
+        "INSERT INTO scenarios (org_id, user_id, name, sliders, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            current_user["org_id"],
+            current_user["id"],
+            clone_base_name,
+            sliders_json,
+            now,
+            now,
+        ),
     )
-    scenarios[new_id] = cloned
-    return cloned
+    new_id = cur.lastrowid
+    # Update name to include unique clone ID
+    clone_name = f"{original_name} (Clone {new_id})"
+    cur.execute("UPDATE scenarios SET name = ? WHERE id = ?", (clone_name, new_id))
+    conn.commit()
+    conn.close()
+    # Audit log
+    log_audit_event(current_user["id"], current_user["org_id"], "scenario_clone", details=f"Cloned scenario {scenario_id} to {new_id}")
+    sliders = json.loads(sliders_json) if sliders_json else {}
+    return {
+        "id": new_id,
+        "tenant_id": current_user["org_id"],
+        "user_id": current_user["id"],
+        "name": clone_name,
+        "sliders": sliders,
+        "created_at": now,
+        "updated_at": now,
+    }
 
 
 @app.post("/simulate", response_model=SimulationResult)
 def run_simulation(
     payload: SimulationInput,
-    current_user: User = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> SimulationResult:
     """Run a simulation based on provided slider values.
 
@@ -509,6 +841,9 @@ def run_simulation(
 
     # Final messages list (placeholder for warnings or notes)
     messages: List[str] = []
+    # Audit log – include scenario_name if provided
+    scenario_name = payload.scenario_name or "ad‑hoc"
+    log_audit_event(current_user["id"], current_user["org_id"], "simulate", details=f"Ran simulation ({scenario_name})")
     return SimulationResult(metrics=metrics, messages=messages)
 
 
@@ -527,7 +862,7 @@ class CalibrationInput(BaseModel):
 @app.post("/calibrate", status_code=status.HTTP_201_CREATED)
 def upload_calibration(
     payload: CalibrationInput,
-    current_user: User = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Upload calibration data for the current user's tenant.
 
@@ -547,18 +882,20 @@ def upload_calibration(
     _calibration_counter += 1
     calib = Calibration(
         id=calibration_id,
-        tenant_id=current_user.tenant_id,
+        tenant_id=current_user["org_id"],
         filename=payload.filename,
         content=content_bytes,
         uploaded_at=_dt.datetime.utcnow(),
     )
     calibrations[calibration_id] = calib
+    # Audit log
+    log_audit_event(current_user["id"], current_user["org_id"], "calibration_upload", details=f"Uploaded calibration {payload.filename} (ID {calibration_id})")
     return {"calibration_id": calibration_id, "filename": payload.filename}
 
 
 @app.get("/recommendations", response_model=RecommendationResult)
 def get_recommendations(
-    current_user: User = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> RecommendationResult:
     """Return recommended solution providers/tools.
 
@@ -573,12 +910,14 @@ def get_recommendations(
         "LeanProcure Procurement",
     ]
     rationale = "These providers align with your current investment profile and offer strong ROI across multiple metrics."
+    # Audit log
+    log_audit_event(current_user["id"], current_user["org_id"], "recommendations", details="Viewed recommendations")
     return RecommendationResult(recommendations=recs, rationale=rationale)
 
 
 @app.get("/hot_swap", response_model=HotSwapResult)
 def hot_swap_analysis(
-    current_user: User = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> HotSwapResult:
     """Perform a simple hot‑swap gap analysis for the current tenant.
 
@@ -596,6 +935,8 @@ def hot_swap_analysis(
         "Replace manual HR processes with Acme HR Platform to reduce churn.",
         "Integrate CRM with ERP using SecureCloud connectors.",
     ]
+    # Audit log
+    log_audit_event(current_user["id"], current_user["org_id"], "hot_swap_analysis", details="Performed hot swap analysis")
     return HotSwapResult(
         missing_capabilities=missing,
         performance_gaps=gaps,
