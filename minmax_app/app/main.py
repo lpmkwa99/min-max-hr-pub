@@ -275,6 +275,25 @@ def init_db() -> None:
     conn.close()
 
 
+    # Calibration parameters table
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS calibration_params (
+            org_id INTEGER NOT NULL,
+            param_name TEXT NOT NULL,
+            value REAL NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (org_id, param_name),
+            FOREIGN KEY (org_id) REFERENCES organizations(id)
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_db_connection() -> sqlite3.Connection:
     """Return a new SQLite connection with row factory set to dict-like."""
     conn = sqlite3.connect(DB_PATH)
@@ -398,6 +417,44 @@ def log_audit_event(user_id: int, org_id: int, action: str, details: Optional[st
     )
     conn.commit()
     conn.close()
+
+
+def set_calibration_params(org_id: int, params: Dict[str, float]) -> None:
+    """Insert or update calibration parameters for an organization.
+
+    Each key in ``params`` corresponds to a model parameter or baseline metric.
+    Existing values are overwritten. A timestamp is recorded for auditing.
+    """
+    now = _dt.datetime.utcnow().isoformat()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    for name, value in params.items():
+        cur.execute(
+            "INSERT INTO calibration_params (org_id, param_name, value, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(org_id, param_name) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (org_id, name, float(value), now),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_calibration_params(org_id: int) -> Dict[str, float]:
+    """Return all calibration parameters for the given organization.
+
+    The result is a mapping from parameter names to their calibrated values.
+    If no parameters are stored, an empty dict is returned.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT param_name, value FROM calibration_params WHERE org_id = ?",
+        (org_id,),
+    )
+    params: Dict[str, float] = {}
+    for row in cur.fetchall():
+        params[row["param_name"]] = float(row["value"])
+    conn.close()
+    return params
 
 
 # Ensure the database schema is created on module import. This call
@@ -767,6 +824,14 @@ def run_simulation(
         "roi": 0.0,
     }
 
+    # Apply calibration baseline overrides if present for this org
+    calibrations = get_calibration_params(current_user["org_id"])
+    for param_name, value in calibrations.items():
+        if param_name.startswith("baseline_"):
+            metric = param_name[len("baseline_"):]
+            if metric in base_values:
+                base_values[metric] = float(value)
+
     # Helper functions for diminishing returns
     def saturating_effect(value: float, alpha: float = 0.05) -> float:
         """Return a value in [0,1] exhibiting diminishing returns.
@@ -911,15 +976,17 @@ def run_simulation(
 
 
 # Internal helper to compute simulation metrics without user context.
-def compute_simulation_metrics(sliders: Dict[str, float]) -> Dict[str, float]:
-    """Compute business metrics from slider values.
+def compute_simulation_metrics(sliders: Dict[str, float], org_id: Optional[int] = None) -> Dict[str, float]:
+    """Compute business metrics from slider values with optional calibration.
 
     This helper mirrors the logic used in the /simulate endpoint but returns only
-    the metrics dict. It is used by comparison and reporting functions to
+    the metrics dict. It accepts an optional ``org_id``; if provided, any
+    calibration parameters for that organization will override baseline values
+    before calculations. It is used by comparison and reporting functions to
     evaluate scenario versions without repeating API calls.
     """
     import math
-    # Initialize metrics with baseline values (same as in run_simulation)
+    # Initialize baseline values
     base_values = {
         "employee_satisfaction": 50.0,
         "customer_satisfaction": 50.0,
@@ -937,16 +1004,20 @@ def compute_simulation_metrics(sliders: Dict[str, float]) -> Dict[str, float]:
         "lead_time": 10.0,
         "roi": 0.0,
     }
-
+    # Apply calibration baseline overrides
+    if org_id is not None:
+        calibrations = get_calibration_params(org_id)
+        for param_name, value in calibrations.items():
+            if param_name.startswith("baseline_"):
+                metric = param_name[len("baseline_"):]
+                if metric in base_values:
+                    base_values[metric] = float(value)
     def saturating_effect(value: float, alpha: float = 0.05) -> float:
         return 1.0 - math.exp(-alpha * value)
-
     def optimal_effect(value: float) -> float:
         return math.sin(math.pi * value / 100.0)
-
     def get_slider(name: str) -> float:
         return float(sliders.get(name, 0.0))
-
     # People module
     training = get_slider("training_budget")
     benefits = get_slider("benefits_budget")
@@ -955,7 +1026,6 @@ def compute_simulation_metrics(sliders: Dict[str, float]) -> Dict[str, float]:
     people_effect = saturating_effect(people_level)
     base_values["employee_satisfaction"] += 30.0 * people_effect
     base_values["roi"] += 5.0 * people_effect
-
     # Marketing module
     lead_gen = get_slider("lead_generation")
     social_media = get_slider("social_media")
@@ -963,7 +1033,6 @@ def compute_simulation_metrics(sliders: Dict[str, float]) -> Dict[str, float]:
     marketing_level = (lead_gen * 0.6 + social_media * 0.3 + events * 0.1)
     marketing_effect = saturating_effect(marketing_level)
     base_values["roi"] += 50.0 * marketing_effect
-
     # Customer Support & CX module
     support_inv = get_slider("support_investment")
     onboarding_quality = get_slider("onboarding_quality")
@@ -978,7 +1047,6 @@ def compute_simulation_metrics(sliders: Dict[str, float]) -> Dict[str, float]:
     response_reduction = 0.8 * support_effect
     base_values["first_response_time"] = base_values["first_response_time"] * (1.0 - response_reduction)
     base_values["roi"] += 3.0 * support_effect
-
     # Finance & Accounting module
     automation_level = get_slider("financial_process_automation")
     cost_opt_level = get_slider("cost_optimization")
@@ -988,7 +1056,6 @@ def compute_simulation_metrics(sliders: Dict[str, float]) -> Dict[str, float]:
     base_values["cogs_reduction"] += 20.0 * cost_opt_effect
     base_values["budget_variance"] = base_values["budget_variance"] * (1.0 - 0.8 * automation_effect)
     base_values["roi"] += 4.0 * (automation_effect + cost_opt_effect)
-
     # IT Infrastructure & Security module
     modernization_level = get_slider("it_modernization_budget")
     cyber_level = get_slider("cybersecurity_spend")
@@ -999,7 +1066,6 @@ def compute_simulation_metrics(sliders: Dict[str, float]) -> Dict[str, float]:
     base_values["security_incidents"] = base_values["security_incidents"] * (1.0 - 0.8 * cyber_effect)
     base_values["productivity_boost"] += 20.0 * modern_effect
     base_values["roi"] += 2.0 * modern_effect
-
     # Procurement & Supply Chain module
     inventory_level = get_slider("inventory_optimization")
     supplier_level = get_slider("supplier_management")
@@ -1009,10 +1075,10 @@ def compute_simulation_metrics(sliders: Dict[str, float]) -> Dict[str, float]:
     base_values["procurement_cost_reduction"] += 20.0 * supplier_effect
     base_values["lead_time"] = max(2.0, base_values["lead_time"] * (1.0 - 0.6 * supplier_effect))
     base_values["roi"] += 3.0 * (turnover_effect + supplier_effect)
-
+    # Clamp ROI to 0–100
     base_values["roi"] = max(min(base_values["roi"], 100.0), 0.0)
-
-    metrics = {}
+    # Post-processing to derive metrics
+    metrics: Dict[str, float] = {}
     metrics["employee_satisfaction"] = max(min(base_values["employee_satisfaction"], 100.0), 0.0)
     metrics["customer_satisfaction"] = max(min(base_values["customer_satisfaction"], 100.0), 0.0)
     metrics["nps"] = base_values["nps"]
@@ -1039,8 +1105,9 @@ class CalibrationInput(BaseModel):
     identification only and is not parsed on upload.
     """
 
-    filename: str
-    content: str
+    filename: Optional[str] = None
+    content: Optional[str] = None
+    parameters: Optional[Dict[str, float]] = None
 
 
 @app.post("/calibrate", status_code=status.HTTP_201_CREATED)
@@ -1048,33 +1115,65 @@ def upload_calibration(
     payload: CalibrationInput,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    """Upload calibration data for the current user's tenant.
+    """Upload or set calibration data for the current user's organization.
 
-    The uploaded file content is provided as a base64 string and is
-    stored in memory. No parsing is performed here; the content is
-    simply saved. In a production implementation you would parse the
-    encoded file and update calibration parameters accordingly.
+    Calibration data can be provided in one of two formats:
+
+    1. A ``parameters`` dictionary mapping model parameter names to values. This
+       allows clients to directly specify baseline metrics or multipliers
+       without uploading a file.
+    2. A ``content`` string containing base64‑encoded CSV data. The CSV
+       should have two columns: ``param_name`` and ``value`` (no header is
+       required). Each line is parsed into a parameter entry. Invalid lines
+       are ignored. A filename may be provided for reference.
+
+    After parsing, all parameter values are stored in the calibration table
+    for the user's organization using ``set_calibration_params``. Previous
+    values for the same parameters are overwritten. An audit event is
+    recorded. The response includes the stored parameter names and values.
     """
     import base64
-
-    global _calibration_counter
-    try:
-        content_bytes = base64.b64decode(payload.content.encode("utf-8"), validate=True)
-    except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid base64 content: {exc}")
-    calibration_id = _calibration_counter
-    _calibration_counter += 1
-    calib = Calibration(
-        id=calibration_id,
-        tenant_id=current_user["org_id"],
-        filename=payload.filename,
-        content=content_bytes,
-        uploaded_at=_dt.datetime.utcnow(),
-    )
-    calibrations[calibration_id] = calib
+    import csv
+    params: Dict[str, float] = {}
+    # Case 1: direct parameters
+    if payload.parameters:
+        for key, value in payload.parameters.items():
+            try:
+                params[key] = float(value)
+            except Exception:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid parameter value for {key}: {value}")
+    # Case 2: base64 CSV content
+    elif payload.content:
+        try:
+            decoded = base64.b64decode(payload.content.encode("utf-8"), validate=True).decode("utf-8")
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid base64 content: {exc}")
+        # Parse CSV: expect "param_name,value" on each line
+        reader = csv.reader(decoded.splitlines())
+        for row in reader:
+            if not row or len(row) < 2:
+                continue
+            name = row[0].strip()
+            try:
+                value = float(row[1].strip())
+            except Exception:
+                continue
+            params[name] = value
+    else:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No calibration data provided")
+    # Persist calibration parameters
+    set_calibration_params(current_user["org_id"], params)
     # Audit log
-    log_audit_event(current_user["id"], current_user["org_id"], "calibration_upload", details=f"Uploaded calibration {payload.filename} (ID {calibration_id})")
-    return {"calibration_id": calibration_id, "filename": payload.filename}
+    log_audit_event(
+        current_user["id"],
+        current_user["org_id"],
+        "calibration_update",
+        details=f"Updated calibration parameters: {', '.join(params.keys())}",
+    )
+    return {
+        "organization_id": current_user["org_id"],
+        "updated_parameters": params,
+    }
 
 
 @app.get("/recommendations", response_model=RecommendationResult)
@@ -1097,6 +1196,22 @@ def get_recommendations(
     # Audit log
     log_audit_event(current_user["id"], current_user["org_id"], "recommendations", details="Viewed recommendations")
     return RecommendationResult(recommendations=recs, rationale=rationale)
+
+
+# Calibration retrieval endpoint
+@app.get("/calibration")
+def fetch_calibration(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return all calibration parameters for the current user's organization.
+
+    This endpoint returns a mapping of parameter names to their calibrated
+    values. If no parameters have been set, an empty object is returned.
+    """
+    params = get_calibration_params(current_user["org_id"])
+    # Audit log
+    log_audit_event(current_user["id"], current_user["org_id"], "calibration_fetch", details="Fetched calibration parameters")
+    return params
 
 
 @app.get("/hot_swap", response_model=HotSwapResult)
@@ -1331,8 +1446,9 @@ def compare_scenario_versions(
         val_b = float(sliders_b.get(key, 0.0))
         diff[key] = val_b - val_a
     # Compute metrics for both versions
-    metrics_a = compute_simulation_metrics(sliders_a)
-    metrics_b = compute_simulation_metrics(sliders_b)
+    # Compute metrics with calibration for this org
+    metrics_a = compute_simulation_metrics(sliders_a, org_id=current_user["org_id"])
+    metrics_b = compute_simulation_metrics(sliders_b, org_id=current_user["org_id"])
     metrics_diff = {}
     for mkey in metrics_a.keys():
         metrics_diff[mkey] = metrics_b[mkey] - metrics_a[mkey]
