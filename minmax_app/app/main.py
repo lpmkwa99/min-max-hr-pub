@@ -111,6 +111,17 @@ class HotSwapResult(BaseModel):
     suggestions: List[str]
 
 
+# Input schema for creating a new scenario version
+class ScenarioVersionInput(BaseModel):
+    """Schema for creating a new version of an existing scenario.
+
+    ``sliders`` must include all slider values to persist for the version.
+    A free‑form ``comment`` can be provided to describe the changes.
+    """
+    sliders: Dict[str, float]
+    comment: Optional[str] = None
+
+
 # In‑memory stores (deprecated)
 #
 # These dictionaries were used in the initial prototype to hold users,
@@ -217,6 +228,22 @@ def init_db() -> None:
             details TEXT,
             FOREIGN KEY(user_id) REFERENCES users(id),
             FOREIGN KEY(org_id) REFERENCES organizations(id)
+        );
+        """
+    )
+    # Scenario versions table
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scenario_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scenario_id INTEGER NOT NULL,
+            version INTEGER NOT NULL,
+            sliders TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            created_by INTEGER NOT NULL,
+            comment TEXT,
+            FOREIGN KEY(scenario_id) REFERENCES scenarios(id),
+            FOREIGN KEY(created_by) REFERENCES users(id)
         );
         """
     )
@@ -564,6 +591,18 @@ def create_scenario(
         ),
     )
     scenario_id = cur.lastrowid
+    # Also insert initial version (version 1)
+    cur.execute(
+        "INSERT INTO scenario_versions (scenario_id, version, sliders, created_at, created_by, comment) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            scenario_id,
+            1,
+            sliders_json,
+            now,
+            current_user["id"],
+            "Initial version",
+        ),
+    )
     conn.commit()
     conn.close()
     # Audit log
@@ -944,6 +983,209 @@ def hot_swap_analysis(
         budget_misalignment=budget,
         suggestions=suggestions,
     )
+
+
+################################################################################
+# Scenario Versioning Endpoints
+################################################################################
+
+
+@app.post("/scenario/{scenario_id}/versions", status_code=status.HTTP_201_CREATED)
+def create_scenario_version(
+    scenario_id: int,
+    payload: ScenarioVersionInput,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Create a new version for an existing scenario.
+
+    The request must include a complete set of sliders. A version number is
+    assigned automatically based on the highest existing version for the
+    scenario. Only users within the same organization as the scenario may
+    create versions. A comment describing the changes may be provided.
+    """
+    import json
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Verify scenario exists and belongs to org
+    cur.execute("SELECT org_id FROM scenarios WHERE id = ?", (scenario_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scenario not found")
+    if row["org_id"] != current_user["org_id"]:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    # Determine next version number
+    cur.execute("SELECT MAX(version) as max_version FROM scenario_versions WHERE scenario_id = ?", (scenario_id,))
+    vrow = cur.fetchone()
+    next_version = (vrow["max_version"] or 0) + 1
+    now = _dt.datetime.utcnow().isoformat()
+    sliders_json = json.dumps(payload.sliders)
+    cur.execute(
+        "INSERT INTO scenario_versions (scenario_id, version, sliders, created_at, created_by, comment) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            scenario_id,
+            next_version,
+            sliders_json,
+            now,
+            current_user["id"],
+            payload.comment,
+        ),
+    )
+    version_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    # Audit log
+    log_audit_event(current_user["id"], current_user["org_id"], "scenario_version_create", details=f"Scenario {scenario_id} version {next_version} created")
+    return {
+        "id": version_id,
+        "scenario_id": scenario_id,
+        "version": next_version,
+        "sliders": payload.sliders,
+        "created_at": now,
+        "created_by": current_user["id"],
+        "comment": payload.comment,
+    }
+
+
+@app.get("/scenario/{scenario_id}/versions")
+def list_scenario_versions(
+    scenario_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> List[Dict[str, Any]]:
+    """List all versions for a given scenario.
+
+    Returns version metadata (version number, creation date, creator, comment) in
+    ascending order. Only accessible by users within the scenario's
+    organization.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Verify scenario and org
+    cur.execute("SELECT org_id FROM scenarios WHERE id = ?", (scenario_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scenario not found")
+    if row["org_id"] != current_user["org_id"]:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    # Fetch versions
+    cur.execute(
+        "SELECT id, version, created_at, created_by, comment FROM scenario_versions WHERE scenario_id = ? ORDER BY version ASC",
+        (scenario_id,),
+    )
+    versions = []
+    for vrow in cur.fetchall():
+        versions.append(
+            {
+                "id": vrow["id"],
+                "scenario_id": scenario_id,
+                "version": vrow["version"],
+                "created_at": vrow["created_at"],
+                "created_by": vrow["created_by"],
+                "comment": vrow["comment"],
+            }
+        )
+    conn.close()
+    return versions
+
+
+@app.get("/scenario/{scenario_id}/versions/{version_number}")
+def get_scenario_version(
+    scenario_id: int,
+    version_number: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Retrieve a specific version of a scenario.
+
+    Returns the slider values and metadata for the requested version. Users
+    outside of the scenario's organization cannot access the data.
+    """
+    import json
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Verify scenario and org
+    cur.execute("SELECT org_id FROM scenarios WHERE id = ?", (scenario_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scenario not found")
+    if row["org_id"] != current_user["org_id"]:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    # Fetch version
+    cur.execute(
+        "SELECT id, version, sliders, created_at, created_by, comment FROM scenario_versions WHERE scenario_id = ? AND version = ?",
+        (scenario_id, version_number),
+    )
+    vrow = cur.fetchone()
+    conn.close()
+    if not vrow:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Version not found")
+    sliders = json.loads(vrow["sliders"]) if vrow["sliders"] else {}
+    return {
+        "id": vrow["id"],
+        "scenario_id": scenario_id,
+        "version": vrow["version"],
+        "sliders": sliders,
+        "created_at": vrow["created_at"],
+        "created_by": vrow["created_by"],
+        "comment": vrow["comment"],
+    }
+
+
+@app.get("/scenario/{scenario_id}/compare")
+def compare_scenario_versions(
+    scenario_id: int,
+    version_a: int,
+    version_b: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Compare two versions of the same scenario.
+
+    The comparison returns a dictionary indicating the difference for each slider
+    between version_b and version_a (i.e. value_b - value_a). Both versions
+    must belong to the scenario and the current user's organization.
+    """
+    import json
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Verify scenario and org
+    cur.execute("SELECT org_id FROM scenarios WHERE id = ?", (scenario_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scenario not found")
+    if row["org_id"] != current_user["org_id"]:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    # Fetch both versions
+    cur.execute(
+        "SELECT version, sliders FROM scenario_versions WHERE scenario_id = ? AND version IN (?, ?)",
+        (scenario_id, version_a, version_b),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    if len(rows) != 2:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="One or both versions not found")
+    sliders_a = None
+    sliders_b = None
+    for r in rows:
+        if r["version"] == version_a:
+            sliders_a = json.loads(r["sliders"]) if r["sliders"] else {}
+        elif r["version"] == version_b:
+            sliders_b = json.loads(r["sliders"]) if r["sliders"] else {}
+    if sliders_a is None or sliders_b is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="One or both versions not found")
+    # Compute difference
+    diff = {}
+    all_keys = set(sliders_a.keys()).union(sliders_b.keys())
+    for key in all_keys:
+        val_a = float(sliders_a.get(key, 0.0))
+        val_b = float(sliders_b.get(key, 0.0))
+        diff[key] = val_b - val_a
+    return {"scenario_id": scenario_id, "version_a": version_a, "version_b": version_b, "differences": diff}
 
 
 ################################################################################
