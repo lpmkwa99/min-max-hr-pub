@@ -121,6 +121,29 @@ class ScenarioVersionInput(BaseModel):
     sliders: Dict[str, float]
     comment: Optional[str] = None
 
+class LockRequest(BaseModel):
+    """Schema for locking or unlocking a scenario version.
+
+    ``locked`` indicates whether the version should be locked (True) or
+    unlocked (False). Only users with admin or manager roles may lock
+    or unlock versions. A locked version is intended to mark a
+    snapshot as final and prevent accidental modifications. Creating
+    new versions is still allowed; locking applies only to the
+    selected version itself.
+    """
+    locked: bool
+
+class RestoreRequest(BaseModel):
+    """Schema for restoring a scenario to a specified version.
+
+    ``version`` specifies which version's sliders should be copied back
+    to the scenario's current state. The restore operation will
+    overwrite the scenario's sliders and also create a new version
+    capturing the restored state so that the action is auditable and
+    reversible.
+    """
+    version: int
+
 
 # In‑memory stores (deprecated)
 #
@@ -242,6 +265,7 @@ def init_db() -> None:
             created_at TEXT NOT NULL,
             created_by INTEGER NOT NULL,
             comment TEXT,
+            locked INTEGER DEFAULT 0,
             FOREIGN KEY(scenario_id) REFERENCES scenarios(id),
             FOREIGN KEY(created_by) REFERENCES users(id)
         );
@@ -886,6 +910,127 @@ def run_simulation(
     return SimulationResult(metrics=metrics, messages=messages)
 
 
+# Internal helper to compute simulation metrics without user context.
+def compute_simulation_metrics(sliders: Dict[str, float]) -> Dict[str, float]:
+    """Compute business metrics from slider values.
+
+    This helper mirrors the logic used in the /simulate endpoint but returns only
+    the metrics dict. It is used by comparison and reporting functions to
+    evaluate scenario versions without repeating API calls.
+    """
+    import math
+    # Initialize metrics with baseline values (same as in run_simulation)
+    base_values = {
+        "employee_satisfaction": 50.0,
+        "customer_satisfaction": 50.0,
+        "nps": -10.0,
+        "churn_rate": 15.0,
+        "first_response_time": 24.0,
+        "net_profit_margin": 10.0,
+        "cogs_reduction": 0.0,
+        "budget_variance": 20.0,
+        "system_uptime": 95.0,
+        "security_incidents": 5.0,
+        "productivity_boost": 0.0,
+        "inventory_turnover_ratio": 5.0,
+        "procurement_cost_reduction": 0.0,
+        "lead_time": 10.0,
+        "roi": 0.0,
+    }
+
+    def saturating_effect(value: float, alpha: float = 0.05) -> float:
+        return 1.0 - math.exp(-alpha * value)
+
+    def optimal_effect(value: float) -> float:
+        return math.sin(math.pi * value / 100.0)
+
+    def get_slider(name: str) -> float:
+        return float(sliders.get(name, 0.0))
+
+    # People module
+    training = get_slider("training_budget")
+    benefits = get_slider("benefits_budget")
+    wellness = get_slider("wellness_programs")
+    people_level = (training + benefits + wellness) / 3.0
+    people_effect = saturating_effect(people_level)
+    base_values["employee_satisfaction"] += 30.0 * people_effect
+    base_values["roi"] += 5.0 * people_effect
+
+    # Marketing module
+    lead_gen = get_slider("lead_generation")
+    social_media = get_slider("social_media")
+    events = get_slider("events")
+    marketing_level = (lead_gen * 0.6 + social_media * 0.3 + events * 0.1)
+    marketing_effect = saturating_effect(marketing_level)
+    base_values["roi"] += 50.0 * marketing_effect
+
+    # Customer Support & CX module
+    support_inv = get_slider("support_investment")
+    onboarding_quality = get_slider("onboarding_quality")
+    support_effect = saturating_effect(support_inv)
+    onboarding_effect = saturating_effect(onboarding_quality)
+    base_values["customer_satisfaction"] += 40.0 * support_effect + 20.0 * onboarding_effect
+    base_values["customer_satisfaction"] = min(base_values["customer_satisfaction"], 100.0)
+    base_values["nps"] += 60.0 * support_effect + 40.0 * onboarding_effect
+    base_values["nps"] = max(min(base_values["nps"], 100.0), -100.0)
+    churn_reduction = 0.8 * support_effect + 0.2 * onboarding_effect
+    base_values["churn_rate"] = max(0.0, base_values["churn_rate"] * (1.0 - churn_reduction))
+    response_reduction = 0.8 * support_effect
+    base_values["first_response_time"] = base_values["first_response_time"] * (1.0 - response_reduction)
+    base_values["roi"] += 3.0 * support_effect
+
+    # Finance & Accounting module
+    automation_level = get_slider("financial_process_automation")
+    cost_opt_level = get_slider("cost_optimization")
+    automation_effect = saturating_effect(automation_level)
+    cost_opt_effect = saturating_effect(cost_opt_level)
+    base_values["net_profit_margin"] += 5.0 * automation_effect + 10.0 * cost_opt_effect
+    base_values["cogs_reduction"] += 20.0 * cost_opt_effect
+    base_values["budget_variance"] = base_values["budget_variance"] * (1.0 - 0.8 * automation_effect)
+    base_values["roi"] += 4.0 * (automation_effect + cost_opt_effect)
+
+    # IT Infrastructure & Security module
+    modernization_level = get_slider("it_modernization_budget")
+    cyber_level = get_slider("cybersecurity_spend")
+    modern_effect = saturating_effect(modernization_level)
+    cyber_effect = saturating_effect(cyber_level)
+    base_values["system_uptime"] += 5.0 * modern_effect - 2.0 * cyber_effect
+    base_values["system_uptime"] = min(max(base_values["system_uptime"], 0.0), 100.0)
+    base_values["security_incidents"] = base_values["security_incidents"] * (1.0 - 0.8 * cyber_effect)
+    base_values["productivity_boost"] += 20.0 * modern_effect
+    base_values["roi"] += 2.0 * modern_effect
+
+    # Procurement & Supply Chain module
+    inventory_level = get_slider("inventory_optimization")
+    supplier_level = get_slider("supplier_management")
+    turnover_effect = optimal_effect(inventory_level)
+    base_values["inventory_turnover_ratio"] += 4.0 * turnover_effect
+    supplier_effect = saturating_effect(supplier_level)
+    base_values["procurement_cost_reduction"] += 20.0 * supplier_effect
+    base_values["lead_time"] = max(2.0, base_values["lead_time"] * (1.0 - 0.6 * supplier_effect))
+    base_values["roi"] += 3.0 * (turnover_effect + supplier_effect)
+
+    base_values["roi"] = max(min(base_values["roi"], 100.0), 0.0)
+
+    metrics = {}
+    metrics["employee_satisfaction"] = max(min(base_values["employee_satisfaction"], 100.0), 0.0)
+    metrics["customer_satisfaction"] = max(min(base_values["customer_satisfaction"], 100.0), 0.0)
+    metrics["nps"] = base_values["nps"]
+    metrics["churn_rate"] = max(min(base_values["churn_rate"], 100.0), 0.0)
+    metrics["first_response_score"] = max(min(100.0 - base_values["first_response_time"] * 4.0, 100.0), 0.0)
+    metrics["net_profit_margin"] = max(min(base_values["net_profit_margin"], 100.0), -50.0)
+    metrics["cogs_reduction"] = max(min(base_values["cogs_reduction"], 100.0), 0.0)
+    metrics["budget_adherence"] = max(min(100.0 - base_values["budget_variance"], 100.0), 0.0)
+    metrics["system_uptime"] = max(min(base_values["system_uptime"], 100.0), 0.0)
+    metrics["security_score"] = max(min(100.0 - base_values["security_incidents"] * 20.0, 100.0), 0.0)
+    metrics["productivity_boost"] = max(min(base_values["productivity_boost"], 100.0), 0.0)
+    metrics["inventory_turnover"] = max(min(base_values["inventory_turnover_ratio"] * 10.0, 100.0), 0.0)
+    metrics["procurement_cost_reduction"] = max(min(base_values["procurement_cost_reduction"], 100.0), 0.0)
+    metrics["lead_time_score"] = max(min(100.0 - base_values["lead_time"] * 10.0, 100.0), 0.0)
+    metrics["roi"] = base_values["roi"]
+    return metrics
+
+
 class CalibrationInput(BaseModel):
     """Schema for uploading calibration data.
 
@@ -1178,14 +1323,168 @@ def compare_scenario_versions(
             sliders_b = json.loads(r["sliders"]) if r["sliders"] else {}
     if sliders_a is None or sliders_b is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="One or both versions not found")
-    # Compute difference
+    # Compute slider differences
     diff = {}
     all_keys = set(sliders_a.keys()).union(sliders_b.keys())
     for key in all_keys:
         val_a = float(sliders_a.get(key, 0.0))
         val_b = float(sliders_b.get(key, 0.0))
         diff[key] = val_b - val_a
-    return {"scenario_id": scenario_id, "version_a": version_a, "version_b": version_b, "differences": diff}
+    # Compute metrics for both versions
+    metrics_a = compute_simulation_metrics(sliders_a)
+    metrics_b = compute_simulation_metrics(sliders_b)
+    metrics_diff = {}
+    for mkey in metrics_a.keys():
+        metrics_diff[mkey] = metrics_b[mkey] - metrics_a[mkey]
+    return {
+        "scenario_id": scenario_id,
+        "version_a": version_a,
+        "version_b": version_b,
+        "differences": diff,
+        "metrics_differences": metrics_diff,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Version Locking and Restore Endpoints
+# -----------------------------------------------------------------------------
+
+
+@app.post("/scenario/{scenario_id}/versions/{version_number}/lock")
+def lock_or_unlock_version(
+    scenario_id: int,
+    version_number: int,
+    payload: LockRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Lock or unlock a specific version of a scenario.
+
+    Only users with the role "admin" or "manager" may lock or unlock a
+    version. Locking a version marks it as final, preventing accidental
+    modifications, but does not prevent creating new versions. Unlocking a
+    previously locked version allows it to be considered editable again.
+    """
+    # Authorize role
+    if current_user["role"] not in ("admin", "manager"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only managers or admins may lock/unlock versions")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Verify scenario and org
+    cur.execute("SELECT org_id FROM scenarios WHERE id = ?", (scenario_id,))
+    srow = cur.fetchone()
+    if not srow:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scenario not found")
+    if srow["org_id"] != current_user["org_id"]:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    # Verify version exists
+    cur.execute(
+        "SELECT id, locked FROM scenario_versions WHERE scenario_id = ? AND version = ?",
+        (scenario_id, version_number),
+    )
+    vrow = cur.fetchone()
+    if not vrow:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Version not found")
+    # Update lock status if it differs
+    new_locked = 1 if payload.locked else 0
+    cur.execute(
+        "UPDATE scenario_versions SET locked = ? WHERE scenario_id = ? AND version = ?",
+        (new_locked, scenario_id, version_number),
+    )
+    conn.commit()
+    conn.close()
+    # Audit log
+    action = "scenario_version_lock" if payload.locked else "scenario_version_unlock"
+    log_audit_event(
+        current_user["id"],
+        current_user["org_id"],
+        action,
+        details=f"{'Locked' if payload.locked else 'Unlocked'} scenario {scenario_id} version {version_number}",
+    )
+    return {
+        "scenario_id": scenario_id,
+        "version": version_number,
+        "locked": payload.locked,
+    }
+
+
+@app.post("/scenario/{scenario_id}/restore", status_code=status.HTTP_200_OK)
+def restore_scenario(
+    scenario_id: int,
+    payload: RestoreRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Restore a scenario's sliders to those of a specified version.
+
+    The restore operation copies the slider configuration from the given
+    version back onto the scenario and also creates a new version to
+    record the restoration. This ensures that the previous state is
+    preserved and that the restore action is reversible. Users must
+    belong to the same organization as the scenario. Any role can
+    perform a restore, but the action is logged for auditing.
+    """
+    import json
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Verify scenario and org
+    cur.execute("SELECT org_id, sliders FROM scenarios WHERE id = ?", (scenario_id,))
+    srow = cur.fetchone()
+    if not srow:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scenario not found")
+    if srow["org_id"] != current_user["org_id"]:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    # Fetch the requested version
+    cur.execute(
+        "SELECT sliders, locked FROM scenario_versions WHERE scenario_id = ? AND version = ?",
+        (scenario_id, payload.version),
+    )
+    vrow = cur.fetchone()
+    if not vrow:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Version not found")
+    # Get sliders data
+    sliders_data = vrow["sliders"]
+    # Update scenario's sliders and updated_at
+    now = _dt.datetime.utcnow().isoformat()
+    cur.execute(
+        "UPDATE scenarios SET sliders = ?, updated_at = ? WHERE id = ?",
+        (sliders_data, now, scenario_id),
+    )
+    # Determine next version number for restore snapshot
+    cur.execute("SELECT MAX(version) as max_version FROM scenario_versions WHERE scenario_id = ?", (scenario_id,))
+    mrow = cur.fetchone()
+    next_version = (mrow["max_version"] or 0) + 1
+    # Insert new version capturing the restored state
+    cur.execute(
+        "INSERT INTO scenario_versions (scenario_id, version, sliders, created_at, created_by, comment) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            scenario_id,
+            next_version,
+            sliders_data,
+            now,
+            current_user["id"],
+            f"Restored from version {payload.version}",
+        ),
+    )
+    conn.commit()
+    conn.close()
+    # Audit log
+    log_audit_event(
+        current_user["id"],
+        current_user["org_id"],
+        "scenario_restore",
+        details=f"Restored scenario {scenario_id} from version {payload.version} as version {next_version}",
+    )
+    # Return success and new version info
+    return {
+        "scenario_id": scenario_id,
+        "restored_from": payload.version,
+        "new_version": next_version,
+    }
 
 
 ################################################################################
