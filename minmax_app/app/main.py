@@ -423,6 +423,47 @@ def get_db_connection() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     return conn
 
+# -----------------------------------------------------------------------------
+# Organization settings helpers
+#
+def get_org_settings(org_id: int) -> Dict[str, Any]:
+    """Retrieve settings for an organization.
+
+    If no row exists for the given org_id, this function creates one with
+    default values (advanced_mode = 0).  Returns a dict with key
+    ``advanced_mode`` as an integer (0 or 1).
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT advanced_mode FROM org_settings WHERE org_id = ?", (org_id,))
+    row = cur.fetchone()
+    if not row:
+        # create default settings row
+        cur.execute(
+            "INSERT OR REPLACE INTO org_settings (org_id, advanced_mode) VALUES (?, ?)",
+            (org_id, 0),
+        )
+        conn.commit()
+        advanced_mode = 0
+    else:
+        advanced_mode = row["advanced_mode"]
+    conn.close()
+    return {"advanced_mode": int(advanced_mode)}
+
+def set_org_advanced_mode(org_id: int, enabled: bool) -> None:
+    """Enable or disable advanced mode for a given organization.
+
+    Writes a row into org_settings, creating it if necessary.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO org_settings (org_id, advanced_mode) VALUES (?, ?)",
+        (org_id, 1 if enabled else 0),
+    )
+    conn.commit()
+    conn.close()
+
 
 def init_vendor_data() -> None:
     """Populate the vendors table with sample data if it is empty.
@@ -535,6 +576,61 @@ def init_vendor_data() -> None:
                 json.dumps(vendor["impact"]),
             ),
         )
+    conn.commit()
+    conn.close()
+    # Organization settings table
+    # Holds per‑org configuration flags such as whether advanced mode is enabled.
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS org_settings (
+            org_id INTEGER PRIMARY KEY,
+            advanced_mode INTEGER DEFAULT 0,
+            FOREIGN KEY (org_id) REFERENCES organizations(id)
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    # Provider lifecycle table
+    # Tracks the adoption status of solution providers/tools per organization.
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS provider_lifecycle (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            org_id INTEGER NOT NULL,
+            vendor_id INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            start_date TEXT,
+            end_date TEXT,
+            FOREIGN KEY (org_id) REFERENCES organizations(id),
+            FOREIGN KEY (vendor_id) REFERENCES vendors(id)
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    # User notifications table
+    # Stores messages sent to users (e.g., achievement unlocked notifications) with read status.
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            message TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            read INTEGER DEFAULT 0,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -726,6 +822,9 @@ def init_gamification() -> None:
         ("hot_swap_first", "First Hot Swap", "Perform your first hot swap analysis", 30),
         ("weekly_streak_4", "Weekly Habit Beginner", "Check in weekly for 4 consecutive weeks", 50),
         ("weekly_streak_8", "Weekly Habit Pro", "Check in weekly for 8 consecutive weeks", 100),
+        # ROI achievements reward users for achieving high ROI thresholds
+        ("roi_20", "ROI Achiever", "Achieve ROI of at least 20% in a simulation", 40),
+        ("roi_50", "ROI Master", "Achieve ROI of at least 50% in a simulation", 80),
     ]
     for key, name, description, xp_reward in achievements:
         cur.execute(
@@ -802,6 +901,22 @@ def award_achievement(user_id: int, org_id: int, key: str) -> None:
     award_xp(user_id, org_id, xp_reward)
     # Log achievement award
     log_audit_event(user_id, org_id, "achievement_award", details=f"Achievement {key} awarded")
+    # Create a user notification so the UI can display a badge alert
+    # The notification table stores a simple message and read flag.
+    conn2 = get_db_connection()
+    cur2 = conn2.cursor()
+    now_ts = _dt.datetime.utcnow().isoformat()
+    # Look up the human‑readable achievement name for the message
+    cur2.execute("SELECT name FROM achievements_def WHERE key = ?", (key,))
+    ach_row = cur2.fetchone()
+    ach_name = ach_row["name"] if ach_row else key
+    message = f"Congratulations! You earned the achievement '{ach_name}'."
+    cur2.execute(
+        "INSERT INTO user_notifications (user_id, message, created_at) VALUES (?, ?, ?)",
+        (user_id, message, now_ts),
+    )
+    conn2.commit()
+    conn2.close()
 
 
 def process_gamification_event(user_id: int, org_id: int, event: str) -> None:
@@ -993,6 +1108,68 @@ MODULE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# Advanced module definitions with sub‑levers
+#
+# The design expansion document introduces an "advanced mode" where each high‑level
+# business function is broken down into multiple sub‑levers【70839359902819†L0-L58】.  The
+# sliders defined here expose those granular levers for organizations that opt
+# into advanced mode via the org_settings table.  Each sub‑lever aligns with
+# specific outcomes described in the specifications.  When advanced mode is
+# enabled, these definitions replace the standard MODULE_DEFINITIONS for
+# purposes of UI display and simulation input.  The simulation combines
+# sub‑lever values into the corresponding high‑level domain by averaging them.
+ADVANCED_MODULE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
+    "People": {
+        "description": "Advanced investment levers for People initiatives.",
+        "sliders": [
+            "onboarding_efficiency",       # efficiency of onboarding automation
+            "engagement_programs",        # employee engagement programs
+            "performance_management",     # performance management upgrades
+            "leadership_training"          # leadership development investment
+        ],
+    },
+    "Marketing": {
+        "description": "Advanced levers for marketing, brand and sales alignment.",
+        "sliders": [
+            "campaign_quality",           # quality of marketing campaigns
+            "brand_development",          # brand development initiatives
+            "customer_research",          # investment in market/customer research
+        ],
+    },
+    "Customer Support & CX": {
+        "description": "Advanced levers for customer support and experience management.",
+        "sliders": [
+            "support_staffing",           # staffing level of support team
+            "cx_quality_management",      # quality management programs
+            "self_service_tools"          # investment in self‑service and automation
+        ],
+    },
+    "Finance & Accounting": {
+        "description": "Advanced levers for financial process automation and cost control.",
+        "sliders": [
+            "process_automation",         # extent of automation of financial processes
+            "cost_control",               # investment in cost control initiatives
+            "data_accuracy"               # investment in improving financial data accuracy
+        ],
+    },
+    "IT Infrastructure & Security": {
+        "description": "Advanced levers for IT modernization and security.",
+        "sliders": [
+            "infrastructure_modernization",  # modernization of infrastructure
+            "cybersecurity_programs",        # cybersecurity programs and tools
+            "devops_maturity"                # investment in DevOps maturity and automation
+        ],
+    },
+    "Procurement & Supply Chain": {
+        "description": "Advanced levers for procurement and supply chain optimization.",
+        "sliders": [
+            "inventory_strategy",          # strategy for inventory optimization
+            "supplier_negotiations",       # effectiveness of supplier negotiations
+            "logistics_efficiency"         # investment in logistics efficiency
+        ],
+    },
+}
+
 
 ################################################################################
 # API Endpoints
@@ -1088,8 +1265,28 @@ def get_me(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str
 
 
 @app.get("/modules")
-def list_modules() -> Dict[str, Any]:
-    """List all available modules and their slider definitions."""
+def list_modules(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """List all available modules and their slider definitions.
+
+    The set of modules returned depends on whether the caller's organization
+    has enabled advanced mode.  In advanced mode the modules expose
+    granular sub‑levers as defined in ``ADVANCED_MODULE_DEFINITIONS``【70839359902819†L0-L58】;
+    otherwise the base ``MODULE_DEFINITIONS`` are returned.  This endpoint
+    requires authentication so that the server can look up the caller's
+    organization ID and settings.
+    """
+    # Determine if advanced mode is enabled for the caller's organization
+    org_id = current_user["org_id"]
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT advanced_mode FROM org_settings WHERE org_id = ?",
+        (org_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if row and row["advanced_mode"]:
+        return ADVANCED_MODULE_DEFINITIONS
     return MODULE_DEFINITIONS
 
 
@@ -1255,6 +1452,22 @@ def run_simulation(
     # Import math for diminishing return calculations
     import math
 
+    # Determine if advanced mode is enabled for the caller's organization. In
+    # advanced mode, the simulation uses sub‑levers from
+    # ADVANCED_MODULE_DEFINITIONS and aggregates them into the high‑level
+    # domains by averaging the corresponding slider values. This allows
+    # organizations to tune granular levers without changing the core
+    # simulation formula.
+    conn_mode = get_db_connection()
+    cur_mode = conn_mode.cursor()
+    cur_mode.execute(
+        "SELECT advanced_mode FROM org_settings WHERE org_id = ?",
+        (current_user["org_id"],),
+    )
+    row_mode = cur_mode.fetchone()
+    advanced_enabled = bool(row_mode["advanced_mode"]) if row_mode else False
+    conn_mode.close()
+
     # Initialize metrics with sensible baseline values. Some metrics are on
     # 0–100 scales (e.g. satisfaction, ROI), while others use domain‑specific
     # units (e.g. hours or days) and are later converted to a normalized score.
@@ -1303,26 +1516,58 @@ def run_simulation(
     def get_slider(name: str) -> float:
         return float(sliders.get(name, 0.0))
 
+    # Helper to aggregate advanced sub‑levers into a single value. Returns the
+    # average of provided sliders or 0 if none exist. Assumes inputs are 0–100.
+    def avg_sliders(names: List[str]) -> float:
+        values = [get_slider(n) for n in names]
+        if not values:
+            return 0.0
+        return sum(values) / float(len(values))
+
     # 1. People module (training, benefits, wellness)
-    training = get_slider("training_budget")
-    benefits = get_slider("benefits_budget")
-    wellness = get_slider("wellness_programs")
-    people_level = (training + benefits + wellness) / 3.0
+    if advanced_enabled:
+        people_level = avg_sliders(
+            ADVANCED_MODULE_DEFINITIONS["People"]["sliders"]
+        )
+    else:
+        training = get_slider("training_budget")
+        benefits = get_slider("benefits_budget")
+        wellness = get_slider("wellness_programs")
+        people_level = (training + benefits + wellness) / 3.0
     people_effect = saturating_effect(people_level)
     base_values["employee_satisfaction"] += 30.0 * people_effect
     base_values["roi"] += 5.0 * people_effect
 
     # 2. Marketing module (lead generation, social media, events)
-    lead_gen = get_slider("lead_generation")
-    social_media = get_slider("social_media")
-    events = get_slider("events")
-    marketing_level = (lead_gen * 0.6 + social_media * 0.3 + events * 0.1)
+    if advanced_enabled:
+        # Weighted average for advanced marketing sub‑levers
+        # Campaign quality has the largest impact, followed by brand development and research
+        msliders = ADVANCED_MODULE_DEFINITIONS["Marketing"]["sliders"]
+        # Map order: campaign_quality, brand_development, customer_research
+        cq = get_slider("campaign_quality")
+        bd = get_slider("brand_development")
+        cr = get_slider("customer_research")
+        marketing_level = cq * 0.5 + bd * 0.3 + cr * 0.2
+    else:
+        lead_gen = get_slider("lead_generation")
+        social_media = get_slider("social_media")
+        events = get_slider("events")
+        marketing_level = (lead_gen * 0.6 + social_media * 0.3 + events * 0.1)
     marketing_effect = saturating_effect(marketing_level)
     base_values["roi"] += 50.0 * marketing_effect
 
     # 3. Customer Support & CX module
-    support_inv = get_slider("support_investment")
-    onboarding_quality = get_slider("onboarding_quality")
+    if advanced_enabled:
+        # Aggregate advanced levers for support and onboarding
+        # support_staffing influences majority, cx_quality_management mid, self_service_tools minor
+        ss = get_slider("support_staffing")
+        qm = get_slider("cx_quality_management")
+        ss_tools = get_slider("self_service_tools")
+        support_inv = (ss * 0.5 + qm * 0.3 + ss_tools * 0.2)
+        onboarding_quality = (qm * 0.4 + ss_tools * 0.6)  # quality and self‑service drive onboarding
+    else:
+        support_inv = get_slider("support_investment")
+        onboarding_quality = get_slider("onboarding_quality")
     support_effect = saturating_effect(support_inv)
     onboarding_effect = saturating_effect(onboarding_quality)
     # Customer satisfaction (CSAT) out of 100
@@ -1341,8 +1586,16 @@ def run_simulation(
     base_values["roi"] += 3.0 * support_effect
 
     # 4. Finance & Accounting module
-    automation_level = get_slider("financial_process_automation")
-    cost_opt_level = get_slider("cost_optimization")
+    if advanced_enabled:
+        # process_automation, cost_control, data_accuracy
+        pa = get_slider("process_automation")
+        cc = get_slider("cost_control")
+        da = get_slider("data_accuracy")
+        automation_level = (pa * 0.5 + da * 0.5)
+        cost_opt_level = cc
+    else:
+        automation_level = get_slider("financial_process_automation")
+        cost_opt_level = get_slider("cost_optimization")
     automation_effect = saturating_effect(automation_level)
     cost_opt_effect = saturating_effect(cost_opt_level)
     # Net profit margin improves with automation and cost optimization
@@ -1355,8 +1608,16 @@ def run_simulation(
     base_values["roi"] += 4.0 * (automation_effect + cost_opt_effect)
 
     # 5. IT Infrastructure & Security module
-    modernization_level = get_slider("it_modernization_budget")
-    cyber_level = get_slider("cybersecurity_spend")
+    if advanced_enabled:
+        # infrastructure_modernization, cybersecurity_programs, devops_maturity
+        infra = get_slider("infrastructure_modernization")
+        cyberprog = get_slider("cybersecurity_programs")
+        devops = get_slider("devops_maturity")
+        modernization_level = (infra * 0.6 + devops * 0.4)
+        cyber_level = cyberprog
+    else:
+        modernization_level = get_slider("it_modernization_budget")
+        cyber_level = get_slider("cybersecurity_spend")
     modern_effect = saturating_effect(modernization_level)
     cyber_effect = saturating_effect(cyber_level)
     # System uptime increases with modernization, slightly decreases with heavy security overhead
@@ -1370,8 +1631,16 @@ def run_simulation(
     base_values["roi"] += 2.0 * modern_effect
 
     # 6. Procurement & Supply Chain module
-    inventory_level = get_slider("inventory_optimization")
-    supplier_level = get_slider("supplier_management")
+    if advanced_enabled:
+        # inventory_strategy, supplier_negotiations, logistics_efficiency
+        inv = get_slider("inventory_strategy")
+        supp = get_slider("supplier_negotiations")
+        logi = get_slider("logistics_efficiency")
+        inventory_level = (inv * 0.6 + logi * 0.4)
+        supplier_level = supp
+    else:
+        inventory_level = get_slider("inventory_optimization")
+        supplier_level = get_slider("supplier_management")
     # Inventory turnover ratio has an optimal sweet spot at 50
     turnover_effect = optimal_effect(inventory_level)
     base_values["inventory_turnover_ratio"] += 4.0 * turnover_effect  # adds up to 4 times
@@ -1421,6 +1690,12 @@ def run_simulation(
 
     # Final messages list (placeholder for warnings or notes)
     messages: List[str] = []
+    # Award ROI achievements based on the final ROI metric
+    roi_value = metrics.get("roi", 0.0)
+    if roi_value >= 50.0:
+        award_achievement(current_user["id"], current_user["org_id"], "roi_50")
+    elif roi_value >= 20.0:
+        award_achievement(current_user["id"], current_user["org_id"], "roi_20")
     # Audit log – include scenario_name if provided
     scenario_name = payload.scenario_name or "ad‑hoc"
     log_audit_event(current_user["id"], current_user["org_id"], "simulate", details=f"Ran simulation ({scenario_name})")
@@ -2214,6 +2489,115 @@ def list_vendor_categories(current_user: Dict[str, Any] = Depends(get_current_us
     )
     return categories
 
+# -----------------------------------------------------------------------------
+# Vendor comparison and integration network endpoints
+# -----------------------------------------------------------------------------
+
+@app.get("/vendors/compare")
+def compare_vendors(vendor_ids: str, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """Compare multiple vendors on cost and predicted metric impacts.
+
+    Accepts a comma‑separated list of vendor IDs via the ``vendor_ids`` query
+    parameter.  Returns a dictionary containing a list of vendor details and
+    a comparison matrix of their impacts.  If fewer than two IDs are
+    provided, the matrix will be empty.  This endpoint is read‑only and
+    available to all authenticated users.  An audit entry is recorded.
+    """
+    try:
+        ids = [int(v.strip()) for v in vendor_ids.split(",") if v.strip()]
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid vendor_ids parameter")
+    if not ids:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No vendor IDs provided")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    import json
+    placeholders = ",".join(["?"] * len(ids))
+    cur.execute(
+        f"SELECT id, name, cost, rating, impact_json FROM vendors WHERE id IN ({placeholders})",
+        ids,
+    )
+    rows = cur.fetchall()
+    conn.close()
+    vendors: List[Dict[str, Any]] = []
+    for row in rows:
+        impact = json.loads(row["impact_json"]) if row["impact_json"] else {}
+        vendors.append({"id": row["id"], "name": row["name"], "cost": row["cost"], "rating": row["rating"], "impact": impact})
+    # Build comparison matrix
+    matrix: List[Dict[str, Any]] = []
+    for i in range(len(vendors)):
+        for j in range(i + 1, len(vendors)):
+            v1 = vendors[i]
+            v2 = vendors[j]
+            diff: Dict[str, float] = {}
+            metrics = set(v1["impact"].keys()) | set(v2["impact"].keys())
+            for m in metrics:
+                diff[m] = (v1["impact"].get(m, 0.0)) - (v2["impact"].get(m, 0.0))
+            matrix.append({
+                "pair": [v1["name"], v2["name"]],
+                "cost_diff": v1["cost"] - v2["cost"],
+                "impact_diff": diff,
+            })
+    # Audit event
+    log_audit_event(current_user["id"], current_user["org_id"], "vendors_compare", details=f"Compared vendors {vendor_ids}")
+    return {"vendors": vendors, "comparisons": matrix}
+
+@app.get("/vendors/integration_network")
+def integration_network(vendor_ids: Optional[str] = None, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """Return an integration network graph for selected vendors.
+
+    The graph consists of nodes (vendors) and edges representing declared
+    integrations between vendors.  If ``vendor_ids`` is provided, only those
+    vendors are considered; otherwise the entire catalog is used.  An edge
+    is created between vendor A and B if A's ``integrations`` string
+    contains the name of B (case‑insensitive) or vice versa.  An audit
+    entry is recorded.  Clients can use this data to visualize vendor
+    compatibility【70839359902819†L414-L457】.
+    """
+    import json
+    conn = get_db_connection()
+    cur = conn.cursor()
+    rows = None
+    if vendor_ids:
+        try:
+            ids_list = [int(v.strip()) for v in vendor_ids.split(",") if v.strip()]
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid vendor_ids parameter")
+        if not ids_list:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No vendor IDs provided")
+        placeholders = ",".join(["?"] * len(ids_list))
+        cur.execute(
+            f"SELECT id, name, integrations FROM vendors WHERE id IN ({placeholders})",
+            ids_list,
+        )
+        rows = cur.fetchall()
+    else:
+        cur.execute("SELECT id, name, integrations FROM vendors")
+        rows = cur.fetchall()
+    conn.close()
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+    # Build node list and dictionary for names
+    name_map: Dict[int, str] = {}
+    for row in rows:
+        nodes.append({"id": row["id"], "name": row["name"]})
+        name_map[row["id"]] = row["name"].lower()
+    # Determine edges
+    for i in range(len(rows)):
+        for j in range(i + 1, len(rows)):
+            a = rows[i]
+            b = rows[j]
+            # Lowercase integration strings
+            ints_a = (a["integrations"] or "").lower()
+            ints_b = (b["integrations"] or "").lower()
+            name_a = name_map[a["id"]]
+            name_b = name_map[b["id"]]
+            if name_b in ints_a or name_a in ints_b:
+                edges.append({"source": a["id"], "target": b["id"]})
+    # Audit event
+    log_audit_event(current_user["id"], current_user["org_id"], "vendors_integration_network", details=f"Integration network for {vendor_ids or 'all'}")
+    return {"nodes": nodes, "edges": edges}
+
 
 def _compute_baseline_factors(calibrations: Dict[str, float]) -> Dict[str, float]:
     """Compute weighting factors based on calibration baselines.
@@ -2241,6 +2625,148 @@ def _compute_baseline_factors(calibrations: Dict[str, float]) -> Dict[str, float
             else:
                 factors[metric] = (100.0 - float(baseline)) / 100.0
     return factors
+
+def _recommend_optimal_tools(
+    vendors: List[Dict[str, Any]],
+    budget: float,
+    weights: Dict[str, float],
+    calibration_factors: Dict[str, float],
+    max_bundle_size: int = 3,
+    num_results: int = 3,
+) -> List[Tuple[List[str], float, Dict[str, float]]]:
+    """Compute optimal combinations of vendors under a budget constraint.
+
+    This helper performs a brute‑force search over all combinations of
+    vendors up to ``max_bundle_size`` and returns the top ``num_results``
+    based on weighted improvements.  Each vendor dict must include
+    ``name``, ``cost`` and ``impact`` keys.  The ``weights`` dict maps
+    metric names to user‑defined weights (normalized).  The
+    ``calibration_factors`` dict adjusts metric weights based on
+    organizational baselines【644198553755745†L1715-L1747】.  The score of a bundle
+    is computed as the sum over metrics of (combined impact * weight *
+    calibration_factor).  Negative impacts (e.g. churn reduction) are
+    treated naturally; combining multiple vendors sums their impacts.
+    Returns a list of tuples (list of vendor names, score, combined_impacts)
+    sorted in descending score.
+    """
+    import itertools
+    results: List[Tuple[List[str], float, Dict[str, float]]] = []
+    n = len(vendors)
+    # Precompute vendor attributes for speed
+    vendor_impacts = [v["impact"] for v in vendors]
+    vendor_costs = [v["cost"] for v in vendors]
+    vendor_names = [v["name"] for v in vendors]
+    # Generate combinations up to max_bundle_size
+    for r in range(1, min(max_bundle_size, n) + 1):
+        for combo_indices in itertools.combinations(range(n), r):
+            total_cost = sum(vendor_costs[i] for i in combo_indices)
+            if total_cost > budget:
+                continue
+            # Sum impacts across vendors
+            combined_impacts: Dict[str, float] = {}
+            for i in combo_indices:
+                for metric, val in vendor_impacts[i].items():
+                    combined_impacts[metric] = combined_impacts.get(metric, 0.0) + val
+            # Compute score
+            score = 0.0
+            for metric, weight in weights.items():
+                factor = calibration_factors.get(metric, 1.0)
+                impact_val = combined_impacts.get(metric, 0.0)
+                score += impact_val * weight * factor
+            vendor_list = [vendor_names[i] for i in combo_indices]
+            results.append((vendor_list, score, combined_impacts))
+    # Sort by score descending and limit to num_results
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results[:num_results]
+
+
+@app.post("/recommendations/optimal")
+def get_optimal_recommendations(
+    payload: RecommendationInput,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return optimized combinations of vendors based on user weights and budget.
+
+    This endpoint performs a multi‑objective, budget‑constrained search over
+    available vendors to identify combinations that maximize weighted metric
+    improvements【97530686618726†L0-L145】.  The ``weights`` field in the request
+    specifies user priorities for metrics; if absent, equal weights are used.
+    Calibration baselines are used to adjust weights such that metrics
+    with already‑high baselines contribute less to the score【644198553755745†L1715-L1747】.  The
+    ``strategy_style`` field can be one of ``growth``, ``lean`` or
+    ``retention``; it modifies default weights accordingly.  The
+    ``num_results`` determines how many bundles are returned.  Each bundle
+    includes the selected vendor names, total cost, predicted improvements
+    and a score.  Audit and gamification events are recorded.
+    """
+    # Determine weights
+    weights = payload.weights or {}
+    # Define default weightings by strategy
+    default_weights = {
+        "roi": 1.0,
+        "employee_satisfaction": 1.0,
+        "customer_satisfaction": 1.0,
+        "productivity_boost": 1.0,
+        "churn_rate": 1.0,
+    }
+    if not weights:
+        # If no weights provided, use strategy style or equal weighting
+        if payload.strategy_style:
+            style = payload.strategy_style.lower()
+            if style == "growth":
+                default_weights = {
+                    "roi": 0.4,
+                    "customer_satisfaction": 0.3,
+                    "productivity_boost": 0.3,
+                }
+            elif style == "lean":
+                default_weights = {
+                    "roi": 0.3,
+                    "net_profit_margin": 0.4,
+                    "productivity_boost": 0.3,
+                }
+            elif style == "retention":
+                default_weights = {
+                    "employee_satisfaction": 0.3,
+                    "customer_satisfaction": 0.3,
+                    "churn_rate": 0.4,
+                }
+        weights = default_weights
+    # Normalize weights to sum to 1
+    total_weight = sum(weights.values())
+    if total_weight == 0:
+        weights = {k: 1.0 / len(weights) for k in weights.keys()}
+    else:
+        weights = {k: v / total_weight for k, v in weights.items()}
+    # Fetch calibration factors
+    calibrations = get_calibration_params(current_user["org_id"])
+    baseline_factors = _compute_baseline_factors(calibrations)
+    # Fetch vendors list from DB
+    conn = get_db_connection()
+    cur = conn.cursor()
+    import json
+    cur.execute("SELECT id, name, cost, impact_json FROM vendors")
+    rows = cur.fetchall()
+    conn.close()
+    vendors: List[Dict[str, Any]] = []
+    for row in rows:
+        impact = json.loads(row["impact_json"]) if row["impact_json"] else {}
+        vendors.append({"name": row["name"], "cost": row["cost"], "impact": impact})
+    # Compute optimal bundles
+    combos = _recommend_optimal_tools(vendors, payload.budget, weights, baseline_factors, max_bundle_size=3, num_results=payload.num_results)
+    # Format result list
+    recommendations: List[Dict[str, Any]] = []
+    for vendor_list, score, impacts in combos:
+        total_cost = sum(next(v["cost"] for v in vendors if v["name"] == name) for name in vendor_list)
+        recommendations.append({"vendors": vendor_list, "score": score, "total_cost": total_cost, "combined_impacts": impacts})
+    # Build rationale message for top result
+    rationale = "The recommended bundle maximizes your weighted metrics while staying within budget."
+    # Audit and gamification events
+    log_audit_event(
+        current_user["id"], current_user["org_id"], "recommendations_optimal", details=f"Requested optimal recommendations with budget {payload.budget}"
+    )
+    process_gamification_event(current_user["id"], current_user["org_id"], "recommendations")
+    return {"recommendations": recommendations, "rationale": rationale}
 
 
 @app.post("/recommendations", response_model=RecommendationResult)
@@ -2623,6 +3149,325 @@ def get_streak(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict
         details="Viewed streak status",
     )
     return {"streak_count": streak_count, "last_checkin_date": last_date}
+
+################################################################################
+# Organization settings and admin endpoints
+################################################################################
+
+class AdvancedModeRequest(BaseModel):
+    """Payload for toggling advanced mode."""
+    enabled: bool
+
+@app.get("/org/settings")
+def get_organization_settings(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """Return configuration flags for the caller's organization.
+
+    Provides information such as whether advanced mode is enabled.  This
+    endpoint is useful for clients to configure their UI accordingly.  It
+    records an audit event when accessed.
+    """
+    settings = get_org_settings(current_user["org_id"])
+    # Audit
+    log_audit_event(
+        current_user["id"], current_user["org_id"], "org_settings_view", details="Viewed org settings"
+    )
+    return settings
+
+@app.post("/org/advanced_mode", status_code=status.HTTP_200_OK)
+def toggle_advanced_mode(payload: AdvancedModeRequest, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """Enable or disable advanced mode for the caller's organization.
+
+    Only users with admin or manager roles may change this setting.  When
+    advanced mode is enabled, the API will return granular module sliders and
+    the simulation engine will aggregate sub‑lever values accordingly.  An
+    audit entry is recorded for traceability.
+    """
+    if current_user["role"] not in {"admin", "manager"}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+    set_org_advanced_mode(current_user["org_id"], payload.enabled)
+    # Audit event
+    action = "advanced_mode_enable" if payload.enabled else "advanced_mode_disable"
+    log_audit_event(
+        current_user["id"], current_user["org_id"], action, details=f"Set advanced_mode to {payload.enabled}"
+    )
+    return {"advanced_mode": payload.enabled}
+
+# -----------------------------------------------------------------------------
+# Administrative endpoints
+#
+# The following endpoints are only accessible to users with the ``admin`` role.
+# They allow an organization to perform user management and organization
+# creation.  Admins can create new organizations, invite users, list
+# users in their organization, update user roles and delete users.  These
+# endpoints enforce tenant isolation, meaning admins cannot manage users
+# outside their own organization.
+
+class OrgCreateRequest(BaseModel):
+    name: str
+
+@app.post("/admin/organizations", status_code=status.HTTP_201_CREATED)
+def create_organization(payload: OrgCreateRequest, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """Create a new organization.
+
+    Only admins may create organizations.  The creator's role or org_id is not
+    changed by this action.  Returns the new organization's ID and name.  An
+    audit entry is recorded for traceability.
+    """
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO organizations (name) VALUES (?)", (payload.name,))
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Organization name already exists")
+    org_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    log_audit_event(current_user["id"], current_user["org_id"], "create_organization", details=f"Created org {payload.name}")
+    return {"id": org_id, "name": payload.name}
+
+
+class UserInviteRequest(BaseModel):
+    username: str
+    password: str
+    role: str = Field(default="viewer")
+    org_id: Optional[int] = None
+
+@app.post("/admin/users", status_code=status.HTTP_201_CREATED)
+def invite_user(payload: UserInviteRequest, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """Invite a new user to an organization.
+
+    Admins can add users to their own organization.  Optionally, a different
+    organization ID may be specified if the admin manages multiple orgs.  The
+    username must be unique.  Returns the new user's ID.  An audit entry is
+    recorded.
+    """
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+    org_id = payload.org_id or current_user["org_id"]
+    # Validate role
+    role = payload.role.lower()
+    if role not in {"admin", "manager", "viewer"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid role")
+    # Attempt to create the user
+    try:
+        user_id = create_user(payload.username, payload.password, payload.org_id or get_org_name(org_id), role)
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username already exists")
+    log_audit_event(current_user["id"], current_user["org_id"], "invite_user", details=f"Invited user {payload.username} with role {role}")
+    return {"id": user_id, "username": payload.username, "role": role, "org_id": org_id}
+
+def get_org_name(org_id: int) -> str:
+    """Helper to fetch an organization's name by ID."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM organizations WHERE id = ?", (org_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row["name"] if row else "Unknown"
+
+@app.get("/admin/users")
+def list_org_users(current_user: Dict[str, Any] = Depends(get_current_user)) -> List[Dict[str, Any]]:
+    """List users in the admin's organization.
+
+    Admins and managers may list users in their own organization.  The
+    response includes user IDs, usernames and roles but not password hashes.
+    """
+    if current_user["role"] not in {"admin", "manager"}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, username, role FROM users WHERE org_id = ?", (current_user["org_id"],))
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+@app.put("/admin/users/{user_id}")
+def update_user_role(user_id: int, role: str, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """Update the role of a user within the admin's organization.
+
+    Only admins may change roles.  The user must belong to the same
+    organization as the admin.  Valid roles are admin, manager, viewer.
+    """
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+    role = role.lower()
+    if role not in {"admin", "manager", "viewer"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid role")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Check user belongs to same org
+    cur.execute("SELECT org_id FROM users WHERE id = ?", (user_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    if row["org_id"] != current_user["org_id"]:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot modify user in another organization")
+    cur.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
+    conn.commit()
+    conn.close()
+    log_audit_event(current_user["id"], current_user["org_id"], "update_user_role", details=f"Updated user {user_id} role to {role}")
+    return {"id": user_id, "role": role}
+
+@app.delete("/admin/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_user(user_id: int, current_user: Dict[str, Any] = Depends(get_current_user)) -> None:
+    """Delete a user from the admin's organization.
+
+    Only admins may delete users.  Deleting a user also removes their
+    sessions, streaks and user achievements.  The admin cannot delete
+    themselves.
+    """
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+    if user_id == current_user["id"]:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot delete yourself")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Verify user exists and belongs to same org
+    cur.execute("SELECT org_id FROM users WHERE id = ?", (user_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    if row["org_id"] != current_user["org_id"]:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot delete user in another organization")
+    # Remove user records
+    cur.execute("DELETE FROM user_achievements WHERE user_id = ?", (user_id,))
+    cur.execute("DELETE FROM user_streaks WHERE user_id = ?", (user_id,))
+    cur.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+    cur.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    log_audit_event(current_user["id"], current_user["org_id"], "delete_user", details=f"Deleted user {user_id}")
+    return None
+
+################################################################################
+# Provider lifecycle management
+################################################################################
+
+class LifecycleRequest(BaseModel):
+    vendor_id: int
+    status: str = Field(..., description="Lifecycle status: planning, adopted, pilot, deprecated")
+    end_date: Optional[str] = None
+
+@app.post("/lifecycle", status_code=status.HTTP_201_CREATED)
+def add_or_update_lifecycle(payload: LifecycleRequest, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """Add or update a vendor lifecycle entry for the caller's organization.
+
+    The status must be one of: planning, pilot, adopted, deprecated.  If a
+    lifecycle entry for the vendor/org combination does not exist, it is
+    created with the current date as the start_date.  If it does exist, the
+    status is updated and end_date may be set when status becomes deprecated.
+    Only managers and admins may modify lifecycle entries.
+    """
+    if current_user["role"] not in {"admin", "manager"}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+    status_lower = payload.status.lower()
+    valid_status = {"planning", "pilot", "adopted", "deprecated"}
+    if status_lower not in valid_status:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid lifecycle status")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Check existing entry
+    cur.execute(
+        "SELECT id, status FROM provider_lifecycle WHERE org_id = ? AND vendor_id = ?",
+        (current_user["org_id"], payload.vendor_id),
+    )
+    row = cur.fetchone()
+    now_str = _dt.datetime.utcnow().isoformat()
+    if row:
+        lifecycle_id = row["id"]
+        cur.execute(
+            "UPDATE provider_lifecycle SET status = ?, end_date = ? WHERE id = ?",
+            (status_lower, payload.end_date, lifecycle_id),
+        )
+    else:
+        # Insert new entry
+        cur.execute(
+            "INSERT INTO provider_lifecycle (org_id, vendor_id, status, start_date, end_date) VALUES (?, ?, ?, ?, ?)",
+            (current_user["org_id"], payload.vendor_id, status_lower, now_str, payload.end_date),
+        )
+        lifecycle_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    log_audit_event(
+        current_user["id"], current_user["org_id"], "provider_lifecycle_update", details=f"Vendor {payload.vendor_id} status {status_lower}"
+    )
+    return {"id": lifecycle_id, "vendor_id": payload.vendor_id, "status": status_lower}
+
+@app.get("/lifecycle")
+def list_lifecycle(current_user: Dict[str, Any] = Depends(get_current_user)) -> List[Dict[str, Any]]:
+    """List all lifecycle entries for the caller's organization."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT pl.id, pl.vendor_id, v.name as vendor_name, pl.status, pl.start_date, pl.end_date FROM provider_lifecycle pl "
+        "JOIN vendors v ON pl.vendor_id = v.id WHERE pl.org_id = ?",
+        (current_user["org_id"],),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+################################################################################
+# User notifications
+################################################################################
+
+@app.get("/notifications")
+def list_notifications(all: bool = False, current_user: Dict[str, Any] = Depends(get_current_user)) -> List[Dict[str, Any]]:
+    """Return notifications for the current user.
+
+    By default only unread notifications (read = 0) are returned.  Pass
+    ``?all=true`` to include both read and unread notifications.  Each
+    notification includes its ID, message, timestamp and read flag.  The
+    user may later mark notifications as read via the `/notifications/{id}/read`
+    endpoint.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    if all:
+        cur.execute(
+            "SELECT id, message, created_at, read FROM user_notifications WHERE user_id = ? ORDER BY created_at DESC",
+            (current_user["id"],),
+        )
+    else:
+        cur.execute(
+            "SELECT id, message, created_at, read FROM user_notifications WHERE user_id = ? AND read = 0 ORDER BY created_at DESC",
+            (current_user["id"],),
+        )
+    rows = cur.fetchall()
+    conn.close()
+    # Audit
+    log_audit_event(current_user["id"], current_user["org_id"], "notifications_view", details="Viewed notifications")
+    return [dict(row) for row in rows]
+
+@app.post("/notifications/{notification_id}/read", status_code=status.HTTP_200_OK)
+def mark_notification_read(notification_id: int, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """Mark a notification as read for the current user."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Ensure the notification belongs to the user
+    cur.execute(
+        "SELECT user_id, read FROM user_notifications WHERE id = ?",
+        (notification_id,),
+    )
+    row = cur.fetchone()
+    if not row or row["user_id"] != current_user["id"]:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Notification not found")
+    cur.execute("UPDATE user_notifications SET read = 1 WHERE id = ?", (notification_id,))
+    conn.commit()
+    conn.close()
+    # Audit
+    log_audit_event(
+        current_user["id"], current_user["org_id"], "notification_read", details=f"Marked notification {notification_id} as read"
+    )
+    return {"id": notification_id, "read": True}
 
 
 ################################################################################
