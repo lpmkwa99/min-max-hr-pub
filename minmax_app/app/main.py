@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime as _dt
 import secrets
 from typing import Any, Dict, List, Optional
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi import status
@@ -214,7 +215,7 @@ _calibration_counter = 1
 ################################################################################
 
 # Path to the SQLite database file. It resides inside the package directory
-DB_PATH = "./data.db"
+DB_PATH = Path(__file__).resolve().parent / "data.db"
 
 
 def init_db() -> None:
@@ -224,7 +225,7 @@ def init_db() -> None:
     organizations, users, scenarios, sessions, and audit logs. It is
     idempotent and can be called at startup.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(str(DB_PATH))
     cursor = conn.cursor()
     # Enable foreign keys
     cursor.execute("PRAGMA foreign_keys = ON;")
@@ -317,7 +318,7 @@ def init_db() -> None:
 
 
     # Calibration parameters table
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(str(DB_PATH))
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -339,7 +340,7 @@ def init_db() -> None:
     # ``last_checkin_date`` stores the date of their most recent check-in.
     # Each row's user_id is a foreign key to the users table. This table
     # supports the "Streak Manager" described in the specification【644198553755745†L638-L677】.
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(str(DB_PATH))
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -362,7 +363,7 @@ def init_db() -> None:
     # marketplace is mostly global/read‑only; user‑specific actions like
     # bookmarking live in separate tables. See design expansion for details
     #【70839359902819†L338-L373】.
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(str(DB_PATH))
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -389,7 +390,7 @@ def init_db() -> None:
     # achievements separately allows us to add new achievements without
     # modifying existing user records and to award XP automatically when
     # achievements are earned【644198553755745†L524-L603】.
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(str(DB_PATH))
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -419,7 +420,7 @@ def init_db() -> None:
 
 def get_db_connection() -> sqlite3.Connection:
     """Return a new SQLite connection with row factory set to dict-like."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -580,7 +581,7 @@ def init_vendor_data() -> None:
     conn.close()
     # Organization settings table
     # Holds per‑org configuration flags such as whether advanced mode is enabled.
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(str(DB_PATH))
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -596,7 +597,7 @@ def init_vendor_data() -> None:
 
     # Provider lifecycle table
     # Tracks the adoption status of solution providers/tools per organization.
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(str(DB_PATH))
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -617,7 +618,7 @@ def init_vendor_data() -> None:
 
     # User notifications table
     # Stores messages sent to users (e.g., achievement unlocked notifications) with read status.
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(str(DB_PATH))
     cursor = conn.cursor()
     cursor.execute(
         """
