@@ -825,6 +825,9 @@ def init_gamification() -> None:
         # ROI achievements reward users for achieving high ROI thresholds
         ("roi_20", "ROI Achiever", "Achieve ROI of at least 20% in a simulation", 40),
         ("roi_50", "ROI Master", "Achieve ROI of at least 50% in a simulation", 80),
+        # Additional achievements for high employee satisfaction and budget adherence
+        ("employee_satisfaction_80", "Culture Champion", "Reach employee satisfaction of 80 or higher", 30),
+        ("budget_adherence_high", "Budget Virtuoso", "Achieve budget adherence (variance <= 5%)", 30),
     ]
     for key, name, description, xp_reward in achievements:
         cur.execute(
@@ -1696,6 +1699,12 @@ def run_simulation(
         award_achievement(current_user["id"], current_user["org_id"], "roi_50")
     elif roi_value >= 20.0:
         award_achievement(current_user["id"], current_user["org_id"], "roi_20")
+    # Award employee satisfaction achievement
+    if metrics.get("employee_satisfaction", 0.0) >= 80.0:
+        award_achievement(current_user["id"], current_user["org_id"], "employee_satisfaction_80")
+    # Award budget adherence achievement (variance <=5% -> adherence >=95)
+    if metrics.get("budget_adherence", 0.0) >= 95.0:
+        award_achievement(current_user["id"], current_user["org_id"], "budget_adherence_high")
     # Audit log – include scenario_name if provided
     scenario_name = payload.scenario_name or "ad‑hoc"
     log_audit_event(current_user["id"], current_user["org_id"], "simulate", details=f"Ran simulation ({scenario_name})")
@@ -3395,6 +3404,26 @@ def add_or_update_lifecycle(payload: LifecycleRequest, current_user: Dict[str, A
         lifecycle_id = cur.lastrowid
     conn.commit()
     conn.close()
+    # If a vendor is deprecated, notify all users in the organization
+    if status_lower == "deprecated":
+        conn_n = get_db_connection()
+        cur_n = conn_n.cursor()
+        # Fetch vendor name for message
+        cur_n.execute("SELECT name FROM vendors WHERE id = ?", (payload.vendor_id,))
+        vrow = cur_n.fetchone()
+        vendor_name = vrow["name"] if vrow else str(payload.vendor_id)
+        message = f"Alert: The vendor '{vendor_name}' has been deprecated. Consider replacing or removing it from your stack."
+        now_ts = _dt.datetime.utcnow().isoformat()
+        # Get all users in org
+        cur_n.execute("SELECT id FROM users WHERE org_id = ?", (current_user["org_id"],))
+        user_rows = cur_n.fetchall()
+        for u in user_rows:
+            cur_n.execute(
+                "INSERT INTO user_notifications (user_id, message, created_at) VALUES (?, ?, ?)",
+                (u["id"], message, now_ts),
+            )
+        conn_n.commit()
+        conn_n.close()
     log_audit_event(
         current_user["id"], current_user["org_id"], "provider_lifecycle_update", details=f"Vendor {payload.vendor_id} status {status_lower}"
     )
