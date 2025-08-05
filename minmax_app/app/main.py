@@ -660,24 +660,23 @@ def create_user(username: str, password: str, org_name: str, role: str) -> int:
     """
     salt = secrets.token_hex(16)
     password_hash = hash_password(password, salt)
-    conn = get_db_connection()
-    cur = conn.cursor()
-    # Ensure organization exists
-    cur.execute("SELECT id FROM organizations WHERE name = ?", (org_name,))
-    row = cur.fetchone()
-    if row:
-        org_id = row["id"]
-    else:
-        cur.execute("INSERT INTO organizations (name) VALUES (?)", (org_name,))
-        org_id = cur.lastrowid
-    # Insert user
-    cur.execute(
-        "INSERT INTO users (username, password_hash, salt, org_id, role) VALUES (?, ?, ?, ?, ?)",
-        (username, password_hash, salt, org_id, role),
-    )
-    user_id = cur.lastrowid
-    conn.commit()
-    conn.close()
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        # Ensure organization exists
+        cur.execute("SELECT id FROM organizations WHERE name = ?", (org_name,))
+        row = cur.fetchone()
+        if row:
+            org_id = row["id"]
+        else:
+            cur.execute("INSERT INTO organizations (name) VALUES (?)", (org_name,))
+            org_id = cur.lastrowid
+        # Insert user
+        cur.execute(
+            "INSERT INTO users (username, password_hash, salt, org_id, role) VALUES (?, ?, ?, ?, ?)",
+            (username, password_hash, salt, org_id, role),
+        )
+        user_id = cur.lastrowid
+        conn.commit()
     return user_id
 
 
