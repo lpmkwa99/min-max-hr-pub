@@ -695,7 +695,7 @@ def verify_user_credentials(username: str, password: str) -> Optional[Dict[str, 
         conn.close()
         return None
     salt = row["salt"]
-    stored_hash = row["password_hash"]
+    expected_hash = row["password_hash"]
     user_record = {
         "id": row["id"],
         "username": username,
@@ -703,23 +703,22 @@ def verify_user_credentials(username: str, password: str) -> Optional[Dict[str, 
         "role": row["role"],
     }
 
-    if stored_hash.startswith("pbkdf2_sha256$"):
+    if expected_hash.startswith("pbkdf2_sha256$"):
         try:
-            _alg, iter_str, hash_hex = stored_hash.split("$", 2)
+            _alg, iter_str, _ = expected_hash.split("$", 2)
             iterations = int(iter_str)
         except ValueError:
             conn.close()
             return None
-        calc_hash = hashlib.pbkdf2_hmac(
-            "sha256", password.encode("utf-8"), bytes.fromhex(salt), iterations
-        ).hex()
-        if hmac.compare_digest(calc_hash, hash_hex):
+        if hmac.compare_digest(
+            hash_password(password, salt, iterations), expected_hash
+        ):
             conn.close()
             return user_record
     else:
         # Legacy SHA-256 hashing
         legacy_hash = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
-        if hmac.compare_digest(legacy_hash, stored_hash):
+        if hmac.compare_digest(legacy_hash, expected_hash):
             # Upgrade to PBKDF2 on successful legacy verification
             new_hash = hash_password(password, salt)
             cur.execute(
