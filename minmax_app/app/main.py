@@ -636,9 +636,20 @@ def init_vendor_data() -> None:
     conn.close()
 
 
-def hash_password(password: str, salt: str) -> str:
-    """Return a SHA-256 hash of the password with provided salt."""
-    return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+PBKDF2_ITERATIONS = 200_000
+
+
+def hash_password(password: str, salt: str, iterations: int = PBKDF2_ITERATIONS) -> str:
+    """Return a PBKDF2-HMAC-SHA256 hash of the password.
+
+    The resulting string embeds the algorithm and iteration count so that
+    future changes can be handled gracefully. Salt is expected to be a hex
+    string.
+    """
+    dk = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), bytes.fromhex(salt), iterations
+    )
+    return f"pbkdf2_sha256${iterations}${dk.hex()}"
 
 
 def create_user(username: str, password: str, org_name: str, role: str) -> int:
@@ -647,7 +658,7 @@ def create_user(username: str, password: str, org_name: str, role: str) -> int:
     If the organization does not exist, it will be created. The password is
     salted and hashed before storage.
     """
-    salt = secrets.token_hex(8)
+    salt = secrets.token_hex(16)
     password_hash = hash_password(password, salt)
     conn = get_db_connection()
     cur = conn.cursor()
@@ -684,16 +695,40 @@ def verify_user_credentials(username: str, password: str) -> Optional[Dict[str, 
         conn.close()
         return None
     salt = row["salt"]
-    expected_hash = row["password_hash"]
-    if hash_password(password, salt) == expected_hash:
-        user_record = {
-            "id": row["id"],
-            "username": username,
-            "org_id": row["org_id"],
-            "role": row["role"],
-        }
-        conn.close()
-        return user_record
+    stored_hash = row["password_hash"]
+    user_record = {
+        "id": row["id"],
+        "username": username,
+        "org_id": row["org_id"],
+        "role": row["role"],
+    }
+
+    if stored_hash.startswith("pbkdf2_sha256$"):
+        try:
+            _alg, iter_str, hash_hex = stored_hash.split("$", 2)
+            iterations = int(iter_str)
+        except ValueError:
+            conn.close()
+            return None
+        calc_hash = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), bytes.fromhex(salt), iterations
+        ).hex()
+        if hmac.compare_digest(calc_hash, hash_hex):
+            conn.close()
+            return user_record
+    else:
+        # Legacy SHA-256 hashing
+        legacy_hash = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+        if hmac.compare_digest(legacy_hash, stored_hash):
+            # Upgrade to PBKDF2 on successful legacy verification
+            new_hash = hash_password(password, salt)
+            cur.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (new_hash, row["id"]),
+            )
+            conn.commit()
+            conn.close()
+            return user_record
     conn.close()
     return None
 
